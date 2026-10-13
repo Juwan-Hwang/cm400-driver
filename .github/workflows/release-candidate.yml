@@ -117,10 +117,24 @@ jobs:
           if ($absent.Count) { Write-Host "::error::missing package files: $($absent -join ', ')"; exit 2 }
           foreach ($a in $assets) {
             if ($a.state -ne 'uploaded') { Write-Host "::error::asset $($a.name) is in state '$($a.state)', not uploaded"; exit 2 }
-            # octet-stream fetches the asset content; without the header the API returns JSON metadata
-            gh api "/repos/$env:GITHUB_REPOSITORY/releases/assets/$($a.id)" `
-              -H 'Accept: application/octet-stream' --output (Join-Path $env:PACKAGE_DIR $a.name)
-            if ($LASTEXITCODE -ne 0) { Write-Host "::error::asset download failed for $($a.name)"; exit 2 }
+            if (-not $a.size) { Write-Host "::error::asset $($a.name) reports no size"; exit 2 }
+            # Measured: `gh api` has no --output flag, so it printed its usage and wrote nothing at all.
+            # The download is therefore done explicitly - and without the `Accept: application/json`
+            # default, which would have stored API metadata under the file's name instead of content.
+            $dest = Join-Path $env:PACKAGE_DIR $a.name
+            $headers = @{
+              Authorization = "Bearer $env:GH_TOKEN"
+              Accept        = 'application/octet-stream'
+              'User-Agent'  = 'cm400-release-acceptance'
+            }
+            try {
+              Invoke-WebRequest -Uri "https://api.github.com/repos/$env:GITHUB_REPOSITORY/releases/assets/$($a.id)" `
+                -Headers $headers -OutFile $dest -UseBasicParsing -ErrorAction Stop
+            } catch {
+              Write-Host "::error::asset download failed for $($a.name): $($_.Exception.Message)"
+              exit 2
+            }
+            if (-not (Test-Path $dest)) { Write-Host "::error::$($a.name) was not written"; exit 2 }
             # GitHub's own digest for the stored bytes against a hash of the bytes that arrived: two
             # independent measurements, not one number this step produced and then re-read
             if (-not $a.digest) { Write-Host "::error::asset $($a.name) carries no server-side digest"; exit 2 }
@@ -130,7 +144,8 @@ jobs:
               Write-Host "::error::asset $($a.name) digest mismatch: server says $remote, downloaded file is $local"
               exit 2
             }
-            Write-Host ("  fetched     : {0} ({1} bytes) sha256={2} matches the release record" -f $a.name, $a.size, $local.Substring(0, 16))
+            Write-Host ("  fetched     : {0} ({1} bytes on disk, {2} advertised) sha256={3} matches the release record" -f `
+              $a.name, (Get-Item $dest).Length, $a.size, $local.Substring(0, 16))
           }
           if (@(Get-ChildItem $env:PACKAGE_DIR -File).Count -ne 9) {
             Write-Host '::error::the downloaded set is not exactly nine files'
