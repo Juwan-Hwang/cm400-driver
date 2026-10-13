@@ -57,6 +57,10 @@ jobs:
           # tested against. Bumping this number is a deliberate change: do it in its own commit and
           # fix whatever the newer clippy raises in that commit too.
           toolchain: 1.97.1
+          # requested explicitly: a toolchain installed by this action does not necessarily carry the
+          # components the runner's pre-installed `stable` had, and this job's first two gates are
+          # `cargo fmt --check` and `cargo clippy`
+          components: rustfmt, clippy
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
