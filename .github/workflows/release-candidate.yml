@@ -48,6 +48,10 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          # No `ref: ${{ inputs.tag }}` here: that would interpolate an unvalidated input into an
+          # action parameter. The run is dispatched against the candidate tag, and the step below
+          # asserts the checked-out commit really is that tag's commit, failing otherwise - which is
+          # both safer and louder than trusting the dispatch selection.
           persist-credentials: false
 
       # The catalog verifier is built here, from this checkout, and is deliberately not part of the
@@ -99,14 +103,39 @@ jobs:
             'LICENSE', 'SHA256SUMS.txt', 'cm400.cat', 'cm400.cat.thumbprint.txt', 'cm400.cer',
             'cm400-setup.exe', 'cm400.inf', 'cm400ctl.exe', 'cm400d.exe'
           )
-          $release = gh api "repos/$env:GITHUB_REPOSITORY/releases/tags/$tag" 2>&1
+          # Measured, and the reason this is not `releases/tags/{tag}`: that endpoint answers 404 for a
+          # draft release, because a draft is deliberately not resolvable by tag. Listing releases does
+          # see them, so the draft is found by tag_name + draft and the assets are taken from that
+          # object. A published release with the same tag is rejected here on purpose: the acceptance
+          # run is supposed to judge a candidate, not something already shipped.
+          $release = gh api "repos/$env:GITHUB_REPOSITORY/releases?per_page=100" 2>&1
           if ($LASTEXITCODE -ne 0) {
-            Write-Host "::error::no release found for tag '$tag'; a candidate has to be published as a Draft Release first"
+            Write-Host "::error::the release list could not be read; the candidate cannot be verified"
             Write-Host $release
             exit 2
           }
-          $rel = $release | ConvertFrom-Json
-          Write-Host "  release   : $($rel.name) (draft=$($rel.draft), prerelease=$($rel.prerelease))"
+          $matches = @($release | ConvertFrom-Json | Where-Object { $_.tag_name -eq $tag })
+          if ($matches.Count -ne 1) {
+            Write-Host "::error::expected exactly one release for tag '$tag', found $($matches.Count); a candidate has to be published as a Draft Release first"
+            exit 2
+          }
+          $rel = $matches[0]
+          if (-not $rel.draft) {
+            Write-Host "::error::the release for '$tag' is not a draft; this job judges candidates, not published releases"
+            exit 2
+          }
+          # The verifier is built from this checkout, so this checkout has to be the commit the package
+          # came from. Comparing against the tag's own object, not against `target_commitish` (which can
+          # name a branch that has since moved).
+          $tagRef = gh api "repos/$env:GITHUB_REPOSITORY/git/ref/tags/$tag" 2>&1
+          if ($LASTEXITCODE -ne 0) { Write-Host "::error::the candidate tag could not be read: $tagRef"; exit 2 }
+          $tagSha = ($tagRef | ConvertFrom-Json).object.sha
+          if (-not $tagSha -or $tagSha -ne $env:GITHUB_SHA) {
+            Write-Host "::error::this run checked out $($env:GITHUB_SHA) but the candidate tag points at $tagSha; dispatch the workflow against the tag itself"
+            exit 2
+          }
+          Write-Host "  source      : $tagSha (checkout matches the candidate tag)"
+          Write-Host "  release   : $($rel.name) (id=$($rel.id), draft=$($rel.draft), prerelease=$($rel.prerelease))"
           $assets = @($rel.assets)
           if (-not $assets.Count) { Write-Host '::error::the release holds no assets'; exit 2 }
           $names = @($assets | ForEach-Object { $_.name })
