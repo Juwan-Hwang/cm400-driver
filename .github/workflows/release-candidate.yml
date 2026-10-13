@@ -56,7 +56,9 @@ jobs:
       - name: install the pinned Rust toolchain
         uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
         with:
-          toolchain: stable
+          # the same pinned toolchain as windows.yml, so the verifier that judges a candidate is built
+          # by a compiler the rest of the project has been tested against
+          toolchain: 1.97.1
 
       - name: build the pinned-certificate catalog verifier
         env:

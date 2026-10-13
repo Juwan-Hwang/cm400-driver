@@ -51,7 +51,12 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
         with:
-          toolchain: stable
+          # Pinned, not `stable`. This job rejects clippy lints and ships binaries built from a locked
+          # dependency graph, so a compiler that moves underneath it would either fail the gate with
+          # lints that nobody chose to adopt, or build release binaries with a toolchain nothing was
+          # tested against. Bumping this number is a deliberate change: do it in its own commit and
+          # fix whatever the newer clippy raises in that commit too.
+          toolchain: 1.97.1
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
