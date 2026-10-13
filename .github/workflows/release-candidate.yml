@@ -218,11 +218,32 @@ jobs:
       # The candidate arrives from the fetch job, and this job never sees a token: receiving it as an
       # artifact means the write-capable credential and the code that executes the candidate are in
       # different jobs, not merely different steps.
+      #
+      # It lands in a staging directory rather than straight into PACKAGE_DIR because an artifact
+      # uploaded from a directory path restores that directory as a subfolder - measured on the first
+      # run that reached this point, where the package ended up with nine files at the top level and
+      # nine more under `candidate\`, and the layout guard correctly refused the directory.
       - name: receive the candidate assets from the fetch job
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: candidate-assets
-          path: ${{ github.workspace }}\candidate
+          path: ${{ runner.temp }}\candidate-in
+
+      - name: flatten the artifact into the package directory
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path $env:PACKAGE_DIR | Out-Null
+          $src = $env:RUNNER_TEMP + '\candidate-in'
+          $files = @(Get-ChildItem $src -Recurse -File)
+          if (-not $files.Count) { Write-Host '::error::the artifact contained no files'; exit 2 }
+          foreach ($f in $files) {
+            if (Test-Path (Join-Path $env:PACKAGE_DIR $f.Name)) {
+              Write-Host "::error::duplicate file in the artifact: $($f.Name)"
+              exit 2
+            }
+            Copy-Item $f.FullName (Join-Path $env:PACKAGE_DIR $f.Name)
+          }
+          Write-Host ("  flattened   : {0} file(s) into PACKAGE_DIR" -f $files.Count)
 
       - name: this run's source is the commit the fetch job validated
         shell: pwsh
