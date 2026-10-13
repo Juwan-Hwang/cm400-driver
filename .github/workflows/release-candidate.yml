@@ -45,6 +45,12 @@ jobs:
     env:
       PACKAGE_DIR: ${{ github.workspace }}\candidate
       LOG_DIR: ${{ github.workspace }}\logs
+      # Blank the run's own token for every step by default. Draft releases are only listable by an
+      # identity with push access, so the one step that needs to see them gets a separate,
+      # repository-scoped secret; nothing that builds, tests or executes candidate content has any
+      # credential in its environment at all.
+      GITHUB_TOKEN: ''
+      GH_TOKEN: ''
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -88,11 +94,17 @@ jobs:
 
       - name: download the candidate assets from the draft release
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # a repository-scoped, short-lived token, injected into this step only
+          GH_TOKEN: ${{ secrets.CANDIDATE_RELEASE_TOKEN }}
           CANDIDATE_TAG: ${{ inputs.tag }}
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path $env:PACKAGE_DIR, $env:LOG_DIR | Out-Null
+          if (-not $env:GH_TOKEN) {
+            Write-Host '::error::CANDIDATE_RELEASE_TOKEN is not set; the draft candidate cannot be read, and the run must not proceed without it'
+            exit 2
+          }
+          Write-Host ("  credential    : present ({0} characters, value not printed)" -f $env:GH_TOKEN.Length)
           $tag = $env:CANDIDATE_TAG
           if ($tag -notmatch '^[A-Za-z0-9._/-]{1,100}$') {
             Write-Host '::error::refusing an unexpected tag value; a candidate tag is not a download URL'
@@ -151,8 +163,17 @@ jobs:
             gh api "/repos/$env:GITHUB_REPOSITORY/releases/assets/$($a.id)" `
               -H 'Accept: application/octet-stream' --output (Join-Path $env:PACKAGE_DIR $a.name)
             if ($LASTEXITCODE -ne 0) { Write-Host "::error::asset download failed for $($a.name)"; exit 2 }
-            Write-Host ("  fetched   : {0} ({1} bytes) sha256={2}" -f $a.name, $a.size,
-              (Get-FileHash (Join-Path $env:PACKAGE_DIR $a.name) -Algorithm SHA256).Hash.Substring(0, 16))
+            # Compare against what GitHub computed from the stored bytes, not against a number the
+            # download step itself chose: a digest from the API and a digest from the file on disk are
+            # two independent measurements of the same object.
+            if (-not $a.digest) { Write-Host "::error::asset $($a.name) carries no server-side digest"; exit 2 }
+            $local = (Get-FileHash (Join-Path $env:PACKAGE_DIR $a.name) -Algorithm SHA256).Hash.ToLowerInvariant()
+            $remote = $a.digest -replace '^sha256:', ''
+            if ($local -ne $remote) {
+              Write-Host "::error::asset $($a.name) digest mismatch: server says $remote, downloaded file is $local"
+              exit 2
+            }
+            Write-Host ("  fetched   : {0} ({1} bytes) sha256={2} (matches the release record)" -f $a.name, $a.size, $local.Substring(0, 16))
           }
 
       # before anything from the package can run, and re-used later as the drift reference
