@@ -640,6 +640,61 @@ fn report_record_sync(result: Result<cm400_windows::trust_ownership::Record, Vec
 mod deploy_protection_tests {
     use super::*;
 
+    /// The branch above only exercises the refusal on a machine that happens to carry a foreign
+    /// explicit write ACE, so this one manufactures that state and runs everywhere. An explicit grant
+    /// to the account running the test names a trustee the plan does not mention, `/grant:r` therefore
+    /// cannot replace it, and the boundary has to refuse rather than report a hardened directory.
+    #[test]
+    fn a_foreign_explicit_write_ace_makes_the_directory_plan_refuse() {
+        let dir = std::env::temp_dir().join(format!("cm400-deploy-foreign-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("cm400d.exe"), b"image").unwrap();
+
+        let (code, who) = run("whoami.exe", &[]);
+        assert_eq!(
+            code, 0,
+            "cannot determine the account running this test: {who}"
+        );
+        let account = who.lines().next().unwrap_or("").trim().to_string();
+        assert!(!account.is_empty(), "whoami produced no account name");
+
+        let (code, out) = run(
+            "icacls.exe",
+            &[
+                &dir.to_string_lossy(),
+                "/grant",
+                &format!("{account}:(OI)(CI)F"),
+            ],
+        );
+        assert_eq!(code, 0, "the foreign ACE could not be created: {out}");
+
+        // if the rule cannot even see the ACE this test just added, the rest would prove nothing
+        let before = icacls_report(&dir).expect("the DACL must be readable");
+        let stray =
+            cm400_windows::security::unexpected_write_grants(&before, &DEPLOY_ALLOWED_WRITERS);
+        assert!(
+            !stray.is_empty(),
+            "the manufactured ACE is invisible to the boundary rule, so this test would prove nothing:\n{before}"
+        );
+
+        let err = apply_and_verify(&dir, deploy_dir_grants(&dir))
+            .expect_err("granting around a foreign write ACE must not count as hardening the path");
+        assert!(
+            err.contains("unexpected write principals"),
+            "refused for the wrong reason: {err}"
+        );
+        // and the refusal has to be the end of it: the same foreign writer must still be reported, so
+        // no caller can read this as a directory it is safe to leave a service image in
+        let after = icacls_report(&dir).expect("the DACL must still be readable after the refusal");
+        assert!(
+            !cm400_windows::security::unexpected_write_grants(&after, &DEPLOY_ALLOWED_WRITERS)
+                .is_empty(),
+            "the refusal left a DACL the boundary would accept:\n{after}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn a_deploy_directory_plan_leaves_ordinary_users_no_way_to_replace_the_image() {
         let dir = std::env::temp_dir().join(format!("cm400-deploy-{}", std::process::id()));
@@ -648,6 +703,26 @@ mod deploy_protection_tests {
         // lay the image down first, the way an elevated installer does, then close the boundary
         let file = dir.join("cm400d.exe");
         std::fs::write(&file, b"image").unwrap();
+
+        // What this machine granted here, recorded before anything is asked of it. An unreadable DACL is
+        // a failure of this test rather than evidence that nothing is anomalous - "I cannot tell who can
+        // write the deployment directory" must never be read as "nobody can". The starting principals
+        // are not the branch key, because an inherited foreign ACE is exactly what the plan's
+        // `/inheritance:r` clears while an explicit one for a trustee the plan does not name survives;
+        // only the second can make the plan fail, and that is where the two paths are told apart.
+        let start =
+            icacls_report(&dir).expect("the starting DACL of the test directory must be readable");
+        let foreign_at_start =
+            cm400_windows::security::unexpected_write_grants(&start, &DEPLOY_ALLOWED_WRITERS);
+        eprintln!(
+            "starting DACL: {} foreign write principal(s){}",
+            foreign_at_start.len(),
+            if foreign_at_start.is_empty() {
+                String::new()
+            } else {
+                format!(": {}", foreign_at_start.join("; "))
+            }
+        );
 
         let unprotected =
             icacls_report(&dir).expect("the DACL of a fresh temp directory is readable");
@@ -671,8 +746,49 @@ mod deploy_protection_tests {
         std::fs::write(dir.join("planted-before.exe"), b"x")
             .expect("with the permissive baseline, creating a file must work");
 
-        apply_and_verify(&dir, deploy_dir_grants(&dir))
-            .expect("the directory plan must be applicable");
+        match apply_and_verify(&dir, deploy_dir_grants(&dir)) {
+            Ok(()) => {}
+            Err(err) => {
+                // The plan could not establish the boundary because some principal the plan does not
+                // name kept an explicit write ACE. That refusal is the security property, so assert it
+                // rather than letting the outcome depend on the machine - and assert it is a refusal,
+                // not a success and not some unrelated failure that would hide a real defect.
+                eprintln!("branch: the plan refused this directory - asserting the refusal");
+                assert!(
+                    err.contains("unexpected write principals"),
+                    "the plan failed for a reason other than a surviving foreign writer: {err}"
+                );
+                // The refusal cannot be mistaken for a completed deployment: reading the boundary back
+                // still reports a foreign writer, so no caller may record this path as protected. (The
+                // grants that did run are not being asserted away here - what is asserted is that the
+                // result is still unacceptable, which is the property that matters to the installer.)
+                let after_refusal =
+                    icacls_report(&dir).expect("the DACL must still be readable after the refusal");
+                assert!(
+                    !cm400_windows::security::unexpected_write_grants(
+                        &after_refusal,
+                        &DEPLOY_ALLOWED_WRITERS
+                    )
+                    .is_empty(),
+                    "the refusal left a DACL the boundary would accept:\n{after_refusal}"
+                );
+                // and nothing beyond what this test itself wrote appeared in the directory
+                let mut entries: Vec<String> = std::fs::read_dir(&dir)
+                    .expect("the directory remains listable")
+                    .filter_map(|e| e.ok())
+                    .map(|e| e.file_name().to_string_lossy().to_string())
+                    .collect();
+                entries.sort();
+                assert_eq!(
+                    entries,
+                    vec!["cm400d.exe".to_string(), "planted-before.exe".to_string()],
+                    "the refused plan must not have staged anything else"
+                );
+                let _ = std::fs::remove_dir_all(&dir);
+                return;
+            }
+        }
+        eprintln!("branch: the plan applied - asserting the boundary it establishes");
         let after = icacls_report(&dir).unwrap();
         assert!(
             !cm400_windows::security::standard_user_can_perturb(&after),
@@ -1357,6 +1473,11 @@ fn daemon_grants(path: &std::path::Path) -> Vec<String> {
     )
 }
 
+/// The principals allowed to hold a write-like right on a deployment path: the two accounts that have
+/// to be able to manage the image, and nobody who runs it. Named once so a test can measure the rule
+/// the installer actually applies instead of restating it and drifting away from it.
+const DEPLOY_ALLOWED_WRITERS: [&str; 2] = ["NT AUTHORITY\\SYSTEM", "BUILTIN\\Administrators"];
+
 /// The directory needs the same boundary as the file inside it. Restricting only the file's DACL is
 /// not enough: delete or replace rights come from the **parent directory**, and `create_dir_all` does
 /// not touch the ACL of a directory that already exists. On a clean Windows the default is fine, but
@@ -1427,10 +1548,7 @@ fn apply_and_verify(path: &std::path::Path, argv: Vec<String>) -> Result<(), Str
     // not would be invisible to it, as would a report whose ACEs could not be parsed at all. Both are
     // treated as unsafe here, because "I cannot tell who can write the service binary" is not
     // evidence that nobody can.
-    let stray = cm400_windows::security::unexpected_write_grants(
-        &report,
-        &["NT AUTHORITY\\SYSTEM", "BUILTIN\\Administrators"],
-    );
+    let stray = cm400_windows::security::unexpected_write_grants(&report, &DEPLOY_ALLOWED_WRITERS);
     if !stray.is_empty() {
         return Err(format!(
             "{}: unexpected write principals:\n  {}",
