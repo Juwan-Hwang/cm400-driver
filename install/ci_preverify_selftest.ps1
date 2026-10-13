@@ -157,6 +157,25 @@ Write-Host ("        (scanned {0} code lines)" -f @($exposable -split "`n").Coun
 $hits = @($guardPatterns | Where-Object { $exposable -match $_ })
 if ($hits.Count) { Bad 'no-execution guard' "the verifier may run package code: $($hits -join ', ')" } else { Ok 'the verifier contains no execution path for package binaries' }
 
+# the layout guard needs a positive control of its own: a flat directory must produce no problems at
+# all. Without this, a guard that flags everything - as the 8.3-versus-long path comparison did on a
+# build runner, where every top-level file looked nested - would pass its negative cases while refusing
+# every real package.
+$flat = Join-Path $WorkRoot 'layout-flat'
+Remove-Item $flat -Recurse -Force -EA SilentlyContinue
+New-Item -ItemType Directory -Force -Path $flat | Out-Null
+foreach ($n in @('cm400.inf', 'cm400.cat', 'SHA256SUMS.txt')) { Set-Content -Path (Join-Path $flat $n) -Value 'x' -Encoding ascii }
+$flatProblems = @(Get-PackageLayoutProblems -Dir $flat -ExpectedFiles @('cm400.inf', 'cm400.cat', 'SHA256SUMS.txt'))
+if ($flatProblems.Count) { Bad 'layout guard, flat directory' "refused a flat package: $($flatProblems -join ' / ')" }
+else { Ok 'the layout guard accepts a flat directory (positive control)' }
+# and the negative control still counts only what is genuinely under a subdirectory
+New-Item -ItemType Directory -Force -Path (Join-Path $flat 'sub') | Out-Null
+Set-Content -Path (Join-Path $flat 'sub\extra.exe') -Value 'x' -Encoding ascii
+$nestedProblems = @(Get-PackageLayoutProblems -Dir $flat -ExpectedFiles @('cm400.inf', 'cm400.cat', 'SHA256SUMS.txt'))
+$one = @($nestedProblems | Where-Object { $_ -match '1 nested item' })
+if ($one.Count) { Ok 'the layout guard counts exactly the nested item, not the flat ones' }
+else { Bad 'layout guard, nested directory' "expected one nested item reported, got: $($nestedProblems -join ' / ')" }
+
 # positive control for the guard itself: a sibling script that really does run the shipped verifier must
 # be flagged by the same patterns. Without this, a guard that matches nothing at all would look like a pass.
 $control = Get-CodeOnly (Join-Path $PSScriptRoot 'ci_candidate_verify.ps1')

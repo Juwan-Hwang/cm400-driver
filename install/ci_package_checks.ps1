@@ -33,7 +33,7 @@
 
 # The two statuses a catalog may be accepted under, with the reason each is tolerable.
 #
-# MEASURED, and this list must not be widened on the basis of it (the maintainer-side release notes (RELEASE-READINESS) §10f):
+# MEASURED, and this list must not be widened on the basis of it (maintainer-side release notes, RELEASE-READINESS §10f):
 # a catalog signed by a self-signed code-signing certificate that this machine does not trust reports
 # `UnknownError`, not `NotTrusted`, and `SignerCertificate` is still present with the exact DER. A
 # catalog whose member file was modified behind an intact catalog reports the same `UnknownError`, so
@@ -121,8 +121,15 @@ function Get-PackageLayoutProblems {
     foreach ($want in $ExpectedFiles) {
         if ($present -notcontains $want) { $problems += "expected file is missing: $want" }
     }
-    # nested content is only visible with -Recurse; a package must be a flat set of files
-    $nested = @(Get-ChildItem $Dir -Force -Recurse -EA SilentlyContinue | Where-Object { $_.FullName -ne (Join-Path $Dir $_.Name) })
+    # nested content is only visible with -Recurse; a package must be a flat set of files. Comparing
+    # constructed paths against the caller's string proved unreliable twice over: a build runner's
+    # `$env:TEMP` arrives as the 8.3 form `C:\Users\RUNNER~1\...` while Get-ChildItem reports the long
+    # `...\runneradmin\...`, and deriving the root from whichever entry happens to sort first made the
+    # answer depend on enumeration order. Both sets below come from the same API, so the comparison is
+    # between like things and nothing has to be rebuilt by hand.
+    $direct = @(Get-ChildItem -LiteralPath $Dir -Force -EA SilentlyContinue | ForEach-Object { $_.FullName })
+    $nested = @(Get-ChildItem -LiteralPath $Dir -Force -Recurse -EA SilentlyContinue |
+        Where-Object { $direct -notcontains $_.FullName })
     if ($nested.Count) {
         $problems += "$($nested.Count) nested item(s) exist under the package directory (e.g. $($nested[0].FullName))"
     }
