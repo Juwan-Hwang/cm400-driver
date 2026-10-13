@@ -133,7 +133,23 @@ if (Test-Path $decoyPath) { Write-Host "  decoy message kept at $decoyPath" }
 # all four symbols. The fixture judges its own output (collection, verified signer, identity gate) and
 # exits non-zero if the artifact does not actually contain the bait, so a successful API call alone
 # cannot be mistaken for a completed test.
-$harness = 'E:\DevEnv\rust\target\release\cm400-trust-test.exe'
+#
+# Release binaries are located relative to the build that produced them, never through a hardcoded
+# machine path: a CI runner sets CARGO_TARGET_DIR, a plain local build leaves them under the
+# repository's own target directory. The first existing candidate wins; if none exists the reported
+# path is the one a reader would need to build into, so the "NOT built" message stays actionable.
+function Find-ReleaseBinary {
+    param([string]$Name)
+    $roots = @()
+    if ($env:CARGO_TARGET_DIR) { $roots += (Join-Path $env:CARGO_TARGET_DIR 'release') }
+    $roots += (Join-Path $RepoRoot 'target\release')
+    foreach ($r in $roots) {
+        $candidate = Join-Path $r $Name
+        if (Test-Path $candidate) { return $candidate }
+    }
+    return (Join-Path $roots[-1] $Name)
+}
+$harness = Find-ReleaseBinary 'cm400-trust-test.exe'
 $inMsg = Join-Path $out 'in-message'
 New-Item -ItemType Directory -Path $inMsg -Force | Out-Null
 Copy-Item (Join-Path $out 'cm400.inf') (Join-Path $inMsg 'cm400.inf') -Force
@@ -182,8 +198,7 @@ foreach ($name in 'Root', 'TrustedPublisher') {
 }
 
 Write-Host '--- the package as the shipped verifier sees it, with the throwaway trusted ---'
-$setup = Join-Path $env:CARGO_TARGET_DIR 'release\cm400-setup.exe'
-if (-not (Test-Path $setup)) { $setup = 'E:\DevEnv\rust\target\release\cm400-setup.exe' }
+$setup = Find-ReleaseBinary 'cm400-setup.exe'
 foreach ($dir in @($out, $inMsg)) {
     if (-not (Test-Path (Join-Path $dir 'cm400.cat'))) { continue }
     Write-Host "  package: $dir"

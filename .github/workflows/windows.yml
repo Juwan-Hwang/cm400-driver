@@ -58,6 +58,13 @@ jobs:
       - name: formatting is enforced, not advisory
         run: cargo fmt --all --check
 
+      # Before the tests, not after: the in-message decoy fixture (the T-A case) runs the release build
+      # of cm400-trust-test.exe, so a job that builds it afterwards cannot measure that case at all. The
+      # test fails rather than skips when the fixture cannot be produced, which is only meaningful if CI
+      # actually provides the toolchain.
+      - name: release build of the shipped binaries
+        run: cargo build --workspace --bins --release --locked
+
       - name: tests (workspace)
         run: cargo test --workspace --locked
 
@@ -81,9 +88,6 @@ jobs:
         run: |
           cargo clippy --workspace --all-targets --locked -- -D warnings
           if ($LASTEXITCODE -ne 0) { Write-Host "::error::clippy failed ($LASTEXITCODE)"; exit 1 }
-
-      - name: release build of the shipped binaries
-        run: cargo build --workspace --bins --release --locked
 
       # No signing certificate exists in CI on purpose, so this validates the packaging constraints
       # (whitelist, forbidden-artifact rejection, manifest) without pretending to produce a package.
