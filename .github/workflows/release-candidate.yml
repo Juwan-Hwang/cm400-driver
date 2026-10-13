@@ -39,16 +39,124 @@ permissions:
   contents: read
 
 jobs:
+  # A job whose only job is to read the draft and hand the bytes over. `permissions` can be set on a
+  # workflow or a job, never on a single step, so the push-level Contents token a draft release needs
+  # cannot live in the same job that later executes candidate content - an Action can reach the token
+  # through the `github.token` context without anyone passing it in. This job checks out nothing, builds
+  # nothing, runs nothing it downloads, and its token dies with the job.
+  fetch-candidate:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write   # push-level, which is what makes a draft listable by the job token at all
+    env:
+      PACKAGE_DIR: ${{ github.workspace }}\candidate
+      CANDIDATE_TAG: ${{ inputs.tag }}
+    outputs:
+      # the commit this job proved the tag points at, so the acceptance job can require its own
+      # checkout to be that same commit rather than merely "a commit on the default branch"
+      tag-sha: ${{ steps.read.outputs.tagsha }}
+    steps:
+      - id: read
+        name: read the draft release and download the nine assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path $env:PACKAGE_DIR | Out-Null
+          if (-not $env:GH_TOKEN) {
+            Write-Host '::error::the job token is not available; a draft release cannot be read without it'
+            exit 2
+          }
+          $tag = $env:CANDIDATE_TAG
+          if ($tag -notmatch '^[A-Za-z0-9._/-]{1,100}$') {
+            Write-Host '::error::refusing an unexpected tag value; a candidate tag is not a download URL'
+            exit 2
+          }
+          # the release notes or an unrelated tool must not become package content by accident
+          $expected = @(
+            'LICENSE', 'SHA256SUMS.txt', 'cm400.cat', 'cm400.cat.thumbprint.txt', 'cm400.cer',
+            'cm400-setup.exe', 'cm400.inf', 'cm400ctl.exe', 'cm400d.exe'
+          )
+          # Measured, and the reason this is not `releases/tags/{tag}`: that endpoint answers 404 for a
+          # draft, because a draft is deliberately not resolvable by tag name. Listing releases does see
+          # drafts, but only for an identity with push access - which is why this job exists and the
+          # acceptance job, which runs `contents: read`, cannot do this itself.
+          $release = gh api "repos/$env:GITHUB_REPOSITORY/releases?per_page=100" 2>&1
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::error::the release list could not be read; the candidate cannot be verified"
+            Write-Host $release
+            exit 2
+          }
+          $matches = @($release | ConvertFrom-Json | Where-Object { $_.tag_name -eq $tag })
+          if ($matches.Count -ne 1) {
+            Write-Host "::error::expected exactly one release for tag '$tag', found $($matches.Count); a candidate has to be published as a Draft Release first"
+            exit 2
+          }
+          $rel = $matches[0]
+          if (-not $rel.draft) {
+            Write-Host "::error::the release for '$tag' is not a draft; this job judges candidates, not published releases"
+            exit 2
+          }
+          # the tag's own object, not `target_commitish`, which can name a branch that has since moved
+          $tagRef = gh api "repos/$env:GITHUB_REPOSITORY/git/ref/tags/$tag" 2>&1
+          if ($LASTEXITCODE -ne 0) { Write-Host "::error::the candidate tag could not be read: $tagRef"; exit 2 }
+          $tagSha = ($tagRef | ConvertFrom-Json).object.sha
+          if (-not $tagSha) { Write-Host '::error::the candidate tag carries no commit'; exit 2 }
+          "tagsha=$tagSha" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          Write-Host "  candidate   : tag $tag -> $tagSha (job commit $env:GITHUB_SHA)"
+          Write-Host "  release     : $($rel.name) (id=$($rel.id), draft=$($rel.draft), prerelease=$($rel.prerelease))"
+          $assets = @($rel.assets)
+          $names = @($assets | ForEach-Object { $_.name })
+          $dupes = @($names | Group-Object | Where-Object { $_.Count -gt 1 })
+          $unknown = @($names | Where-Object { $expected -notcontains $_ })
+          $absent = @($expected | Where-Object { $names -notcontains $_ })
+          if ($assets.Count -ne 9) { Write-Host "::error::expected nine assets, found $($assets.Count)"; exit 2 }
+          if ($dupes.Count) { Write-Host "::error::duplicate asset names: $($dupes.Name -join ', ')"; exit 2 }
+          if ($unknown.Count) { Write-Host "::error::assets that are not package content: $($unknown -join ', ')"; exit 2 }
+          if ($absent.Count) { Write-Host "::error::missing package files: $($absent -join ', ')"; exit 2 }
+          foreach ($a in $assets) {
+            if ($a.state -ne 'uploaded') { Write-Host "::error::asset $($a.name) is in state '$($a.state)', not uploaded"; exit 2 }
+            # octet-stream fetches the asset content; without the header the API returns JSON metadata
+            gh api "/repos/$env:GITHUB_REPOSITORY/releases/assets/$($a.id)" `
+              -H 'Accept: application/octet-stream' --output (Join-Path $env:PACKAGE_DIR $a.name)
+            if ($LASTEXITCODE -ne 0) { Write-Host "::error::asset download failed for $($a.name)"; exit 2 }
+            # GitHub's own digest for the stored bytes against a hash of the bytes that arrived: two
+            # independent measurements, not one number this step produced and then re-read
+            if (-not $a.digest) { Write-Host "::error::asset $($a.name) carries no server-side digest"; exit 2 }
+            $local = (Get-FileHash (Join-Path $env:PACKAGE_DIR $a.name) -Algorithm SHA256).Hash.ToLowerInvariant()
+            $remote = $a.digest -replace '^sha256:', ''
+            if ($local -ne $remote) {
+              Write-Host "::error::asset $($a.name) digest mismatch: server says $remote, downloaded file is $local"
+              exit 2
+            }
+            Write-Host ("  fetched     : {0} ({1} bytes) sha256={2} matches the release record" -f $a.name, $a.size, $local.Substring(0, 16))
+          }
+          if (@(Get-ChildItem $env:PACKAGE_DIR -File).Count -ne 9) {
+            Write-Host '::error::the downloaded set is not exactly nine files'
+            exit 2
+          }
+
+      - name: hand the candidate to the acceptance job
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: candidate-assets
+          path: ${{ github.workspace }}\candidate
+          if-no-files-found: error
+          # the fetch job's token is the only write-capable credential in this workflow; keeping the
+          # artifact short-lived (one day) bounds how long the candidate bytes sit retrievable
+          retention-days: 1
+
   clean-vm-acceptance:
     runs-on: windows-latest
     timeout-minutes: 30
+    needs: fetch-candidate
     env:
       PACKAGE_DIR: ${{ github.workspace }}\candidate
       LOG_DIR: ${{ github.workspace }}\logs
-      # Blank the run's own token for every step by default. Draft releases are only listable by an
-      # identity with push access, so the one step that needs to see them gets a separate,
-      # repository-scoped secret; nothing that builds, tests or executes candidate content has any
-      # credential in its environment at all.
+      # This job holds no credential at all: the candidate arrives as an artifact from the fetch job, so
+      # nothing that builds, tests, or executes downloaded content can reach a token - blanking the
+      # variable per step would not be enough, because a step can also read `github.token`.
       GITHUB_TOKEN: ''
       GH_TOKEN: ''
     steps:
@@ -92,94 +200,64 @@ jobs:
           "CATSIG=$exe" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           Write-Host "  verifier built at $exe"
 
-      - name: download the candidate assets from the draft release
-        env:
-          # a repository-scoped, short-lived token, injected into this step only
-          GH_TOKEN: ${{ secrets.CANDIDATE_RELEASE_TOKEN }}
-          CANDIDATE_TAG: ${{ inputs.tag }}
+      # The candidate arrives from the fetch job, and this job never sees a token: receiving it as an
+      # artifact means the write-capable credential and the code that executes the candidate are in
+      # different jobs, not merely different steps.
+      - name: receive the candidate assets from the fetch job
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: candidate-assets
+          path: ${{ github.workspace }}\candidate
+
+      - name: this run's source is the commit the fetch job validated
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force -Path $env:PACKAGE_DIR, $env:LOG_DIR | Out-Null
-          if (-not $env:GH_TOKEN) {
-            Write-Host '::error::CANDIDATE_RELEASE_TOKEN is not set; the draft candidate cannot be read, and the run must not proceed without it'
+          $want = '${{ needs.fetch-candidate.outputs.tag-sha }}'
+          if (-not $want) { Write-Host '::error::the fetch job reported no candidate commit'; exit 2 }
+          if ($want -ne $env:GITHUB_SHA) {
+            Write-Host "::error::source is $env:GITHUB_SHA but the candidate was validated against $want; the verifier and the package must come from one commit"
             exit 2
           }
-          Write-Host ("  credential    : present ({0} characters, value not printed)" -f $env:GH_TOKEN.Length)
-          $tag = $env:CANDIDATE_TAG
-          if ($tag -notmatch '^[A-Za-z0-9._/-]{1,100}$') {
-            Write-Host '::error::refusing an unexpected tag value; a candidate tag is not a download URL'
-            exit 2
-          }
-          # the release notes or an unrelated tool must not become package content by accident
+          Write-Host "  source : $env:GITHUB_SHA, matching the candidate tag"
+
+      - name: the delivered set is still exactly the nine assets
+        shell: pwsh
+        run: |
+          # Re-count and re-hash after a second transport. The package carries its own digest list, so the
+          # files are checked against something inside the candidate rather than against a value this step
+          # just produced: an artifact that arrived altered must not pass because nobody looked.
           $expected = @(
             'LICENSE', 'SHA256SUMS.txt', 'cm400.cat', 'cm400.cat.thumbprint.txt', 'cm400.cer',
             'cm400-setup.exe', 'cm400.inf', 'cm400ctl.exe', 'cm400d.exe'
           )
-          # Measured, and the reason this is not `releases/tags/{tag}`: that endpoint answers 404 for a
-          # draft release, because a draft is deliberately not resolvable by tag. Listing releases does
-          # see them, so the draft is found by tag_name + draft and the assets are taken from that
-          # object. A published release with the same tag is rejected here on purpose: the acceptance
-          # run is supposed to judge a candidate, not something already shipped.
-          $release = gh api "repos/$env:GITHUB_REPOSITORY/releases?per_page=100" 2>&1
-          if ($LASTEXITCODE -ne 0) {
-            Write-Host "::error::the release list could not be read; the candidate cannot be verified"
-            Write-Host $release
-            exit 2
+          $have = @(Get-ChildItem $env:PACKAGE_DIR -File)
+          $extra = @($have | ForEach-Object { $_.Name } | Where-Object { $expected -notcontains $_ })
+          $missing = @($expected | Where-Object { $_ -notin @($have | ForEach-Object { $_.Name }) })
+          if ($extra.Count) { Write-Host "::error::unexpected files arrived: $($extra -join ', ')"; exit 2 }
+          if ($missing.Count) { Write-Host "::error::files missing from the artifact: $($missing -join ', ')"; exit 2 }
+          if ($have.Count -ne 9) { Write-Host "::error::expected nine files, got $($have.Count)"; exit 2 }
+          # the manifest inside the package lists seven of the nine: the catalog and the manifest itself
+          # cannot attest to their own bytes, so those two are covered by the catalog signature instead
+          $sums = Get-Content (Join-Path $env:PACKAGE_DIR 'SHA256SUMS.txt')
+          $checked = 0
+          foreach ($line in $sums) {
+            if ($line -notmatch '^([0-9A-Fa-f]{64})\s+(\S+)$') { Write-Host "::error::unparsable manifest line: $line"; exit 2 }
+            $want = $Matches[1].ToUpperInvariant(); $name = $Matches[2]
+            $path = Join-Path $env:PACKAGE_DIR $name
+            if (-not (Test-Path $path)) { Write-Host "::error::manifest lists $name but it is absent"; exit 2 }
+            $got = (Get-FileHash $path -Algorithm SHA256).Hash.ToUpperInvariant()
+            if ($got -ne $want) { Write-Host "::error::$name digest mismatch after transport: manifest $want, file $got"; exit 2 }
+            $checked++
           }
-          $matches = @($release | ConvertFrom-Json | Where-Object { $_.tag_name -eq $tag })
-          if ($matches.Count -ne 1) {
-            Write-Host "::error::expected exactly one release for tag '$tag', found $($matches.Count); a candidate has to be published as a Draft Release first"
-            exit 2
-          }
-          $rel = $matches[0]
-          if (-not $rel.draft) {
-            Write-Host "::error::the release for '$tag' is not a draft; this job judges candidates, not published releases"
-            exit 2
-          }
-          # The verifier is built from this checkout, so this checkout has to be the commit the package
-          # came from. Comparing against the tag's own object, not against `target_commitish` (which can
-          # name a branch that has since moved).
-          $tagRef = gh api "repos/$env:GITHUB_REPOSITORY/git/ref/tags/$tag" 2>&1
-          if ($LASTEXITCODE -ne 0) { Write-Host "::error::the candidate tag could not be read: $tagRef"; exit 2 }
-          $tagSha = ($tagRef | ConvertFrom-Json).object.sha
-          if (-not $tagSha -or $tagSha -ne $env:GITHUB_SHA) {
-            Write-Host "::error::this run checked out $($env:GITHUB_SHA) but the candidate tag points at $tagSha; dispatch the workflow against the tag itself"
-            exit 2
-          }
-          Write-Host "  source      : $tagSha (checkout matches the candidate tag)"
-          Write-Host "  release   : $($rel.name) (id=$($rel.id), draft=$($rel.draft), prerelease=$($rel.prerelease))"
-          $assets = @($rel.assets)
-          if (-not $assets.Count) { Write-Host '::error::the release holds no assets'; exit 2 }
-          $names = @($assets | ForEach-Object { $_.name })
-          $dupes = @($names | Group-Object | Where-Object { $_.Count -gt 1 })
-          $unknown = @($names | Where-Object { $expected -notcontains $_ })
-          $absent = @($expected | Where-Object { $names -notcontains $_ })
-          if ($dupes.Count) { Write-Host "::error::duplicate asset names: $($dupes.Name -join ', ')"; exit 2 }
-          if ($unknown.Count) { Write-Host "::error::assets that are not package content: $($unknown -join ', ')"; exit 2 }
-          if ($absent.Count) { Write-Host "::error::missing package files: $($absent -join ', ')"; exit 2 }
-          foreach ($a in $assets) {
-            if ($a.state -ne 'uploaded') { Write-Host "::error::asset $($a.name) is in state '$($a.state)', not uploaded"; exit 2 }
-            # octet-stream fetches the asset content; without the header the API returns JSON metadata
-            gh api "/repos/$env:GITHUB_REPOSITORY/releases/assets/$($a.id)" `
-              -H 'Accept: application/octet-stream' --output (Join-Path $env:PACKAGE_DIR $a.name)
-            if ($LASTEXITCODE -ne 0) { Write-Host "::error::asset download failed for $($a.name)"; exit 2 }
-            # Compare against what GitHub computed from the stored bytes, not against a number the
-            # download step itself chose: a digest from the API and a digest from the file on disk are
-            # two independent measurements of the same object.
-            if (-not $a.digest) { Write-Host "::error::asset $($a.name) carries no server-side digest"; exit 2 }
-            $local = (Get-FileHash (Join-Path $env:PACKAGE_DIR $a.name) -Algorithm SHA256).Hash.ToLowerInvariant()
-            $remote = $a.digest -replace '^sha256:', ''
-            if ($local -ne $remote) {
-              Write-Host "::error::asset $($a.name) digest mismatch: server says $remote, downloaded file is $local"
-              exit 2
-            }
-            Write-Host ("  fetched   : {0} ({1} bytes) sha256={2} (matches the release record)" -f $a.name, $a.size, $local.Substring(0, 16))
-          }
+          if ($checked -ne 7) { Write-Host "::error::the manifest covers $checked files, expected 7"; exit 2 }
+          Write-Host "  assets : nine files delivered, $checked digests re-verified against the package manifest"
 
       # before anything from the package can run, and re-used later as the drift reference
       - name: capture the pre-execution baseline
         shell: pwsh
-        run: .\install\ci_state_snapshot.ps1 -Out "$env:LOG_DIR\cm400-before-candidate-code.txt"
+        run: |
+          New-Item -ItemType Directory -Force -Path $env:LOG_DIR | Out-Null
+          .\install\ci_state_snapshot.ps1 -Out "$env:LOG_DIR\cm400-before-candidate-code.txt"
 
       # tamper detection is part of the evidence for this run, not a local-only courtesy: it exercises the
       # verifier against copies of the real candidate and never runs candidate code
@@ -247,9 +325,8 @@ jobs:
         run: .\install\ci_state_snapshot.ps1 -Out "$env:LOG_DIR\cm400-ci-final-state.txt"
 
       # Runners are ephemeral and "keep the scene" has to mean something concrete, so the transcripts and
-      # snapshots are printed into the run log, which GitHub retains. An actions/upload-artifact step was
-      # deliberately not added: pinning it needs its commit SHA, which could not be read while the API
-      # quota was exhausted, and nothing here loses information the log does not already carry.
+      # snapshots are printed into the run log, which GitHub retains. The only artifact retained beyond the
+      # run is the candidate itself, which the fetch job hands over with a one-day lifetime.
       - name: print the transcripts and snapshots into the run log
         if: always()
         shell: pwsh
