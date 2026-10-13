@@ -1,0 +1,17 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/cm400-protocol",
+    "crates/cm400-state",
+    "crates/cm400-policy",
+    "crates/cm400-core",
+    "crates/cm400-persistence",
+    "crates/cm400-windows",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/Juwan-Hwang/cm400-driver"
+authors = ["Juwan Hwang"]

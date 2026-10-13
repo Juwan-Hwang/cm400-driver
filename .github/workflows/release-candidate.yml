@@ -1,0 +1,212 @@
+name: release-candidate
+
+# Manual acceptance of a *signed* release candidate on a clean Windows VM. This is not PR CI and it is
+# not a substitute for the hardware acceptance record: there is no CM400 here, so a successful run
+# proves candidate integrity, the expected refusal without a device, the trust rollback, and the
+# recovery uninstall. It never proves that a real device was driven.
+#
+# Where the candidate comes from: the package is signed locally (no signing key exists in CI, by
+# decision), uploaded to a Draft Release for a candidate tag, and downloaded here by that tag. No
+# arbitrary URL is accepted as an executable source, and the tag is passed through an environment
+# variable rather than interpolated into a shell string.
+#
+# Credential shape, stated as it actually works rather than as assumed:
+#   - both workflows set `persist-credentials: false` on actions/checkout. Its default is to persist a
+#     token, and in the current major version that credential is written to a temp file whose path is
+#     handed to git as an extra header - so clearing an environment variable in a later step is NOT proof
+#     a program cannot obtain it. Without persisted credentials there is nothing on disk to find;
+#   - `contents: read` is the only permission the workflow holds (draft assets need an authenticated
+#     request; unauthenticated reads of a draft 404), and the token reaches exactly one step;
+#   - every step that could execute candidate code declares an empty GITHUB_TOKEN/GH_TOKEN, which is
+#     defence in depth, not the primary control.
+#
+# Ordering rule: the read-only baseline is captured BEFORE any candidate binary runs, and re-captured
+# after the verification stage. A drift between the two fails the run, so "the verify stage polluted the
+# clean environment" cannot be quietly ignored.
+#
+# Runners are ephemeral, so "keep the scene" means every transcript and snapshot is printed into the run
+# log even when a step fails.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Candidate tag whose Draft Release holds the package under test (for example v0.1.0-rc1)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  clean-vm-acceptance:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    env:
+      PACKAGE_DIR: ${{ github.workspace }}\candidate
+      LOG_DIR: ${{ github.workspace }}\logs
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The catalog verifier is built here, from this checkout, and is deliberately not part of the
+      # package being verified: the thing that checks cannot be the thing that is checked. Building it
+      # before the baseline step keeps the drift check scoped to the verification stage.
+      - name: install the pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
+        with:
+          toolchain: stable
+
+      - name: build the pinned-certificate catalog verifier
+        env:
+          GITHUB_TOKEN: ''
+          GH_TOKEN: ''
+        shell: pwsh
+        run: |
+          cargo build --release --locked --bin cm400-catsig
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host '::error::the verifier could not be built; the candidate cannot be accepted'
+            exit 1
+          }
+          $exe = if ($env:CARGO_TARGET_DIR) { Join-Path $env:CARGO_TARGET_DIR 'release\cm400-catsig.exe' } else { '' }
+          if (-not $exe -or -not (Test-Path $exe)) {
+            $exe = Join-Path $env:GITHUB_WORKSPACE 'target\release\cm400-catsig.exe'
+          }
+          if (-not (Test-Path $exe)) {
+            Write-Host '::error::cm400-catsig.exe was not produced; refusing to fall back on a trust-state enum'
+            exit 1
+          }
+          "CATSIG=$exe" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "  verifier built at $exe"
+
+      - name: download the candidate assets from the draft release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CANDIDATE_TAG: ${{ inputs.tag }}
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path $env:PACKAGE_DIR, $env:LOG_DIR | Out-Null
+          $tag = $env:CANDIDATE_TAG
+          if ($tag -notmatch '^[A-Za-z0-9._/-]{1,100}$') {
+            Write-Host '::error::refusing an unexpected tag value; a candidate tag is not a download URL'
+            exit 2
+          }
+          # the release notes or an unrelated tool must not become package content by accident
+          $expected = @(
+            'LICENSE', 'SHA256SUMS.txt', 'cm400.cat', 'cm400.cat.thumbprint.txt', 'cm400.cer',
+            'cm400-setup.exe', 'cm400.inf', 'cm400ctl.exe', 'cm400d.exe'
+          )
+          $release = gh api "repos/$env:GITHUB_REPOSITORY/releases/tags/$tag" 2>&1
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::error::no release found for tag '$tag'; a candidate has to be published as a Draft Release first"
+            Write-Host $release
+            exit 2
+          }
+          $rel = $release | ConvertFrom-Json
+          Write-Host "  release   : $($rel.name) (draft=$($rel.draft), prerelease=$($rel.prerelease))"
+          $assets = @($rel.assets)
+          if (-not $assets.Count) { Write-Host '::error::the release holds no assets'; exit 2 }
+          $names = @($assets | ForEach-Object { $_.name })
+          $dupes = @($names | Group-Object | Where-Object { $_.Count -gt 1 })
+          $unknown = @($names | Where-Object { $expected -notcontains $_ })
+          $absent = @($expected | Where-Object { $names -notcontains $_ })
+          if ($dupes.Count) { Write-Host "::error::duplicate asset names: $($dupes.Name -join ', ')"; exit 2 }
+          if ($unknown.Count) { Write-Host "::error::assets that are not package content: $($unknown -join ', ')"; exit 2 }
+          if ($absent.Count) { Write-Host "::error::missing package files: $($absent -join ', ')"; exit 2 }
+          foreach ($a in $assets) {
+            if ($a.state -ne 'uploaded') { Write-Host "::error::asset $($a.name) is in state '$($a.state)', not uploaded"; exit 2 }
+            # octet-stream fetches the asset content; without the header the API returns JSON metadata
+            gh api "/repos/$env:GITHUB_REPOSITORY/releases/assets/$($a.id)" `
+              -H 'Accept: application/octet-stream' --output (Join-Path $env:PACKAGE_DIR $a.name)
+            if ($LASTEXITCODE -ne 0) { Write-Host "::error::asset download failed for $($a.name)"; exit 2 }
+            Write-Host ("  fetched   : {0} ({1} bytes) sha256={2}" -f $a.name, $a.size,
+              (Get-FileHash (Join-Path $env:PACKAGE_DIR $a.name) -Algorithm SHA256).Hash.Substring(0, 16))
+          }
+
+      # before anything from the package can run, and re-used later as the drift reference
+      - name: capture the pre-execution baseline
+        shell: pwsh
+        run: .\install\ci_state_snapshot.ps1 -Out "$env:LOG_DIR\cm400-before-candidate-code.txt"
+
+      # tamper detection is part of the evidence for this run, not a local-only courtesy: it exercises the
+      # verifier against copies of the real candidate and never runs candidate code
+      - name: prove the verifier rejects tampering
+        env:
+          GITHUB_TOKEN: ''
+          GH_TOKEN: ''
+        shell: pwsh
+        run: |
+          if (-not $env:CATSIG) { Write-Host '::error::no verifier binary was built'; exit 1 }
+          .\install\ci_preverify_selftest.ps1 -PackageDir $env:PACKAGE_DIR -Catsig $env:CATSIG
+
+      # the attack regression, against the same candidate: flipped signed content, flipped embedded
+      # certificate, rebuilt member list, swapped pairs and layout smuggling - each asserted with the
+      # reason it was refused, not merely that it was refused
+      - name: attack regression on the downloaded candidate
+        env:
+          GITHUB_TOKEN: ''
+          GH_TOKEN: ''
+        shell: pwsh
+        run: |
+          if (-not $env:CATSIG) { Write-Host '::error::no verifier binary was built'; exit 1 }
+          .\install\ci_catalog_attack_regression.ps1 -Package $env:PACKAGE_DIR -Catsig $env:CATSIG
+
+      - name: verify the candidate before anything acts on it
+        env:
+          GITHUB_TOKEN: ''
+          GH_TOKEN: ''
+        shell: pwsh
+        run: .\install\ci_preverify_candidate.ps1 -PackageDir $env:PACKAGE_DIR -Catsig $env:CATSIG
+
+      # cross-check only, and deliberately after the gate above: this one asks the candidate's own
+      # installer to report on its package, so it is a second opinion from inside the package, not
+      # evidence that the package was accepted
+      - name: the candidate's own report, as a cross-check after the gate
+        env:
+          GITHUB_TOKEN: ''
+          GH_TOKEN: ''
+        shell: pwsh
+        run: .\install\ci_candidate_verify.ps1 -PackageDir $env:PACKAGE_DIR
+
+      - name: the verification stage left the machine as it found it
+        env:
+          GITHUB_TOKEN: ''
+          GH_TOKEN: ''
+        shell: pwsh
+        run: |
+          .\install\ci_state_snapshot.ps1 -Out "$env:LOG_DIR\cm400-after-verify.txt" `
+            -Baseline "$env:LOG_DIR\cm400-before-candidate-code.txt"
+
+      - name: assert this is a clean environment
+        shell: pwsh
+        run: .\install\ci_clean_baseline.ps1 -SnapshotDir $env:LOG_DIR
+
+      - name: device-free install, rollback and recovery uninstall
+        env:
+          GITHUB_TOKEN: ''
+          GH_TOKEN: ''
+        shell: pwsh
+        run: .\install\ci_device_free_install.ps1 -PackageDir $env:PACKAGE_DIR -LogDir $env:LOG_DIR
+
+      - name: final read-only state snapshot
+        if: always()
+        shell: pwsh
+        run: .\install\ci_state_snapshot.ps1 -Out "$env:LOG_DIR\cm400-ci-final-state.txt"
+
+      # Runners are ephemeral and "keep the scene" has to mean something concrete, so the transcripts and
+      # snapshots are printed into the run log, which GitHub retains. An actions/upload-artifact step was
+      # deliberately not added: pinning it needs its commit SHA, which could not be read while the API
+      # quota was exhausted, and nothing here loses information the log does not already carry.
+      - name: print the transcripts and snapshots into the run log
+        if: always()
+        shell: pwsh
+        run: |
+          foreach ($f in @(Get-ChildItem $env:LOG_DIR -File -EA SilentlyContinue)) {
+            Write-Host "::group::$($f.Name)"
+            Get-Content $f.FullName | ForEach-Object { "$_" }
+            Write-Host '::endgroup'
+          }
+          if (-not @(Get-ChildItem $env:LOG_DIR -File -EA SilentlyContinue).Count) {
+            Write-Host 'no log files were produced; the run failed before any step wrote one'
+          }

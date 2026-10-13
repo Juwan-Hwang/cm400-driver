@@ -1,0 +1,36 @@
+/target
+# Packaging output: assembled from the release build plus the signed inputs, regenerated on every
+# run, and containing per-machine artifacts. Never a source directory.
+/dist
+# `Cargo.lock` is committed on purpose. This workspace ships binaries (a Windows service, an
+# installer, a CLI), so reproducibility means pinning the exact dependency graph a release was built
+# and tested with. Ignoring it would let a later `cargo build` resolve different crate versions than
+# the ones that passed the tests and produced the published hashes.
+**/*.rs.bk
+# transient experiment scratch (never commit probe scripts / captures)
+*.pcap
+w0*_*.ps1
+w0*_*.py
+# catalogs are signed by a PER-MACHINE certificate, so they are never portable:
+# the local d3_sign_catalog tooling regenerates them on the target box. The CDF is
+# generated too, because a catalog member id is the file's hash - it changes with
+# file contents and must never be pinned in the repo.
+install/*.cat
+install/*.cdf
+# Same reasoning for the fingerprint artifact: it names the certificate that this machine's
+# d3_sign_catalog.ps1 created, so committing it would pin a per-machine identity and let a stale
+# value steer the uninstall-time cleanup toward the wrong certificate.
+install/*.thumbprint.txt
+
+# Key material must be uncommittable, not merely "don't". A PFX plus its password file is a signing
+# credential; the password is deliberately written to a different directory so one leaked file is not
+# a usable secret, and neither belongs anywhere near a repository, a CI artifact or a release package.
+*.pfx
+*.password
+
+# The fixed publishing identity is different from the per-machine ones above: it is reused across
+# versions, and only its PUBLIC half and fingerprint are recorded here. Committing them is the point -
+# a release must be checkable against a stable identity rather than against whatever cert a machine
+# happened to mint.
+!install/cm400-release.cer
+!install/cm400-release.thumbprint.txt

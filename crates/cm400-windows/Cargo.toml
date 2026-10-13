@@ -1,0 +1,94 @@
+[package]
+name = "cm400-windows"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "CM400 Windows backend: WinUSB motor transport (implements cm400-core::Transport) + cm400ctl diagnostics."
+
+[[bin]]
+name = "cm400ctl"
+path = "src/bin/cm400ctl.rs"
+
+[[bin]]
+name = "cm400-etwprobe"
+path = "src/bin/cm400_etwprobe.rs"
+
+[[bin]]
+name = "cm400-setup"
+path = "src/bin/cm400_setup.rs"
+
+[[bin]]
+name = "cm400-capture-probe"
+path = "src/bin/cm400_capture_probe.rs"
+
+# The IKsControl reachability probe. Diagnostic only: nothing in the shipped service calls it
+# unless its own argument is present in the service binPath.
+[[bin]]
+name = "cm400-iks-probe"
+path = "src/bin/cm400_iks_probe.rs"
+
+# Development-only harness for the trust-establishment component (experiment B). It drives the same
+# library code that the installer is supposed to use, so what it measures is production behaviour.
+# It is NOT part of a release: `install/release_package.ps1` rejects a package containing it, and the
+# shipped CLI deliberately grows no switch for it.
+[[bin]]
+name = "cm400-trust-test"
+path = "src/bin/cm400_trust_test.rs"
+
+# The candidate catalog verifier: the pre-execution gate for release acceptance. It is built by CI from
+# the repository, and it is deliberately NOT one of the nine shipped files - a package cannot be what
+# vouches for itself. `install/release_package.ps1` would refuse a package containing it.
+[[bin]]
+name = "cm400-catsig"
+path = "src/bin/cm400_catsig.rs"
+
+[[bin]]
+name = "cm400d"
+path = "src/bin/cm400d.rs"
+
+[dependencies]
+cm400-core = { path = "../cm400-core" }
+cm400-protocol = { path = "../cm400-protocol" }
+cm400-state = { path = "../cm400-state" }
+cm400-policy = { path = "../cm400-policy" }
+cm400-persistence = { path = "../cm400-persistence" }
+windows-service = "0.8.1"
+# The `#[implement]` macro expands to paths under `windows_core`, so it must be reachable as
+# a direct dependency (it was already in the tree via `windows`).
+windows-core = "0.58"
+
+[dependencies.windows]
+version = "0.58"
+features = [
+    "implement",
+    "Win32_Foundation",
+    "Win32_Security",
+    # Certificate store access for `cert_cleanup` (removing this release's own self-signed
+    # certificate at uninstall time by exact fingerprint + subject + self-signed match).
+    "Win32_Security_Cryptography",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_Devices_Usb",
+    "Win32_Devices_DeviceAndDriverInstallation",
+    "Win32_System_EventLog",
+    "Win32_System_Diagnostics_Etw",
+    "Win32_System_Diagnostics_ToolHelp",
+    # Needed by `proc_identity`: `NtQuerySystemInformation` + `SYSTEM_INFORMATION_CLASS`, used
+    # to test a process-instance source that requires no handle to the target.
+    "Wdk_System_SystemInformation",
+    "Win32_System_Threading",
+    "Win32_System_Time",
+    "Win32_System_Console",
+    "Win32_System_Registry",
+    "Win32_Security_WinTrust",
+    "Win32_Security_Cryptography_Catalog",
+    "Win32_Security_Cryptography_Sip",
+    "Win32_Media_MediaFoundation",
+    # `IKsControl::KsProperty` and the KS property identifier layout, for the DirectShow-side
+    # control probe. Kept separate from MediaFoundation so the two paths stay distinguishable.
+    "Win32_Media_KernelStreaming",
+    "Win32_System_Com",
+    "Win32_System_Variant",
+]

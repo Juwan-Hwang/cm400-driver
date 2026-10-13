@@ -1,0 +1,8 @@
+[package]
+name = "cm400-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "CM400 USB protocol layer: SETUP encoding + the safety whitelist. Platform-agnostic."
+
+[dependencies]

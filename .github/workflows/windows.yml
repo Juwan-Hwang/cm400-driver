@@ -1,0 +1,151 @@
+name: windows
+
+# What this job proves: the workspace builds from a pinned dependency graph, every test passes, the
+# formatting and lint gates are actually enforced rather than noted, no compile warnings are creeping
+# back in, the release whitelist still rejects experiment binaries and private material, the packaging
+# layout is right, and the CI scripts themselves parse on a Windows shell.
+#
+# What it deliberately cannot prove, and must not be described as proving: installation on a clean
+# Windows machine, driver signature trust, real motor actuation, ETW delivery under load, or uninstall
+# side effects. Those need a device, elevation and a machine that has never seen this driver. This job
+# has no signing key and never runs install or uninstall - the signed-candidate acceptance is a
+# separate manual workflow (release-candidate.yml), and packaging here runs with -NoSigning, which
+# validates layout and whitelist only.
+#
+# Third-party actions are pinned by full commit SHA. Refresh them with (the values below came from
+# exactly these calls):
+#   gh api repos/actions/checkout/tags                  --jq '.[0] | .name, .commit.sha'
+#   gh api repos/dtolnay/rust-toolchain/tags            --jq '.[0] | .name, .commit.sha'
+#   gh api repos/Swatinem/rust-cache/tags               --jq '.[0] | .name, .commit.sha'
+# then change the SHA and the comment on the same line together, in its own commit, so a version bump
+# is reviewable as a version bump.
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  quality-and-packaging:
+    runs-on: windows-latest
+    steps:
+      # no persisted credential: this job runs git status and git diff afterwards, and none of it needs
+      # to authenticate as the workflow (see release-candidate.yml for the credential reasoning)
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The lock file is committed (see .gitignore): a CI run that silently resolves different crate
+      # versions is not testing the thing that was built and hashed for a release.
+      - name: lock file present
+        shell: pwsh
+        run: |
+          if (-not (Test-Path Cargo.lock)) {
+            Write-Host '::error::Cargo.lock must be committed for a workspace that ships binaries'
+            exit 1
+          }
+
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
+        with:
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - name: formatting is enforced, not advisory
+        run: cargo fmt --all --check
+
+      - name: tests (workspace)
+        run: cargo test --workspace --locked
+
+      - name: all targets build clean
+        shell: pwsh
+        run: |
+          $out = cargo check --workspace --all-targets --locked 2>&1
+          $out | ForEach-Object { "$_" }
+          $diags = @($out | Select-String -Pattern '^error|^warning')
+          if ($LASTEXITCODE -ne 0) { Write-Host "::error::cargo check failed ($LASTEXITCODE)"; exit 1 }
+          if ($diags.Count -gt 0) {
+            Write-Host "::error::$($diags.Count) compiler diagnostic(s); warnings are treated as failures here"
+            exit 1
+          }
+
+      # Blocking on purpose: the workspace was cleaned up to the point where this passes with a single
+      # locally-scoped allow (Transport's Result<_, ()>, see cm400-core). If this starts failing, the
+      # fix is to repair the code, not to widen the allow list.
+      - name: clippy (warnings are errors)
+        shell: pwsh
+        run: |
+          cargo clippy --workspace --all-targets --locked -- -D warnings
+          if ($LASTEXITCODE -ne 0) { Write-Host "::error::clippy failed ($LASTEXITCODE)"; exit 1 }
+
+      - name: release build of the shipped binaries
+        run: cargo build --workspace --bins --release --locked
+
+      # No signing certificate exists in CI on purpose, so this validates the packaging constraints
+      # (whitelist, forbidden-artifact rejection, manifest) without pretending to produce a package.
+      - name: packaging whitelist is enforced
+        shell: pwsh
+        run: .\install\release_package.ps1 -SkipBuild -NoSigning
+
+      - name: the release folder holds exactly the whitelisted files
+        shell: pwsh
+        run: |
+          $shared = @(
+            'cm400-setup.exe', 'cm400d.exe', 'cm400ctl.exe', 'cm400.inf',
+            'cm400.cat.thumbprint.txt', 'SHA256SUMS.txt', 'LICENSE'
+          )
+          $actual = @(Get-ChildItem dist\staging -File -EA SilentlyContinue | ForEach-Object { $_.Name })
+          $extra = @($actual | Where-Object { $shared -notcontains $_ -and $_ -notin @('cm400.cat', 'cm400.cer') })
+          $missing = @($shared | Where-Object { $actual -notcontains $_ })
+          if ($extra.Count) {
+            Write-Host "::error::files in the release folder that no release should contain: $($extra -join ', ')"
+            exit 1
+          }
+          if ($missing.Count) {
+            Write-Host "::error::expected release files missing: $($missing -join ', ')"
+            exit 1
+          }
+          # this run is -NoSigning, so the two signed-only files must be absent: their absence is the
+          # evidence that CI holds no signing key, not just a layout detail
+          $signedOnly = @($actual | Where-Object { $_ -in @('cm400.cat', 'cm400.cer') })
+          if ($signedOnly.Count) {
+            Write-Host "::error::-NoSigning produced signed-only artifacts: $($signedOnly -join ', ')"
+            exit 1
+          }
+          Write-Host "release folder holds exactly $($actual.Count) CI-whitelisted artifacts and no signed material"
+
+      - name: repository hygiene - no key material or one-shot tooling tracked
+        shell: pwsh
+        run: |
+          $tracked = @(git ls-files)
+          $forbidden = @($tracked | Where-Object {
+            $_ -match '\.pfx$|\.password$|\.key$|private.key|_run_|\.log$|cm400-trust-test|identity-decoy' })
+          if ($forbidden.Count) {
+            Write-Host "::error::tracked files that must never be in the repository: $($forbidden -join ', ')"
+            exit 1
+          }
+          # the private signing material lives outside the repository by policy, so its absence here is
+          # the check; a stray file on the runner would not be a CI failure but a release incident
+          Write-Host "tracked files scanned: $($tracked.Count); forbidden matches: 0"
+
+      - name: CI scripts parse on a Windows shell
+        shell: pwsh
+        run: |
+          $bad = 0
+          foreach ($f in @(Get-ChildItem install -Filter 'ci_*.ps1' -File)) {
+            $errs = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile($f.FullName, [ref]$null, [ref]$errs)
+            if (@($errs).Count) {
+              Write-Host "::error::$($f.Name) does not parse: $(@($errs)[0].Message)"
+              $bad++
+            }
+          }
+          if ($bad) { exit 1 }
+          Write-Host 'all ci_*.ps1 parse'
+
+      - name: whitespace hygiene
+        run: git diff --check

@@ -1,0 +1,10 @@
+[package]
+name = "cm400-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "CM400 Motor Engine: platform-agnostic orchestration over transport/activity/clock/store traits."
+
+[dependencies]
+cm400-state = { path = "../cm400-state" }
+cm400-policy = { path = "../cm400-policy" }

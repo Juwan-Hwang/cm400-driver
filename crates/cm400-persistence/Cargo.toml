@@ -1,0 +1,10 @@
+[package]
+name = "cm400-persistence"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "CM400 motor status persistence: dependency-free serialization + a file-backed Store."
+
+[dependencies]
+cm400-state = { path = "../cm400-state" }
+cm400-core = { path = "../cm400-core" }

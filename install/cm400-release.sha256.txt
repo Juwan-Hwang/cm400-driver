@@ -1,0 +1,10 @@
+# CM400 fixed publishing identity - SHA-256 over the certificate DER (public, no key material).
+# This is the authorization anchor. The installer compares a certificate against the value compiled
+# into its own binary (trust::PINNED_SHA256_DER); a contract test checks this file against that
+# constant so a rotation has to be a deliberate, reviewed code change.
+# The SHA-1 thumbprint in cm400-release.thumbprint.txt is only the handle Windows keys its
+# certificate stores by, and never authorizes a trust write or a deletion on its own.
+subject = CN=CM400 Driver
+sha256_der = E0F6085D48AD522FC0C78901D81E3C4D789B7C28769D5FC0A188809CEAE655F5
+not_before = 2026-10-12T14:06:53
+not_after = 2036-10-12T14:16:53

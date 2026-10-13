@@ -1,0 +1,21 @@
+# Line endings and binary handling, pinned for reproducibility.
+#
+# Why this file exists: the development box runs git with core.autocrlf=true, which means checkout
+# line endings there depend on a local setting. Two things in this project are sensitive to that:
+# rustfmt writes LF and reports a diff against a CRLF working copy, and the release manifest records
+# SHA-256 over the exact bytes of each packaged file. A build that is only reproducible on machines
+# with the same git config is not reproducible.
+#
+# Deliberately narrow. Only the sources whose formatter output is LF-normative, plus the artifacts
+# that must never be text-converted at all. `.inf`, `.ps1`, `.toml` and the markdown docs are left
+# alone on purpose: re-normalizing a file that a signed catalog has already hashed would turn a
+# line-ending preference into a packaging change, and that trade is not worth making here.
+
+*.rs text eol=lf
+
+*.cat binary
+*.cer binary
+*.exe binary
+*.dll binary
+*.pdb binary
+*.pfx binary

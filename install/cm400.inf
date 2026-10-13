@@ -1,0 +1,137 @@
+; ============================================================================
+; CM400 Driver - WinUSB binding for the motor interface (MI_02) ONLY.
+;
+; STATUS: NOT WORKING, and this is the measured result of Phase 2-D4-B.
+;   Staging (D4-A) and installation (D4-B) both succeeded - device showed
+;   CM_PROB_NONE, Service=WinUSB, our class/provider/friendly-name applied - but NO
+;   WinUSB device interface was ever registered: the hardware key ended up with no
+;   DeviceInterfaceGUIDs value at all, discovery found nothing under either GUID, and
+;   the motor was unreachable. MI_02 has been rolled back to the libwdi package
+;   (install/d4_rollback.ps1). UVC on MI_00 was unaffected throughout.
+;
+;   Ruled out by experiment (each plausible, none the cause):
+;     PnpLockdown=1        -> removed, still no interface
+;     Include/Needs winusb -> added as libwdi has, still no interface
+;     Class=USB vs USBDevice -> switched to libwdi's class, still no interface
+;     needs a restart      -> disable/enable after install, value still absent
+;   Leading untested hypothesis: [Motor_Install.HW] never executes for this INF -
+;   the FriendlyName we asked .HW to write also never appeared in expanded form.
+;   One decisive probe settles it: write a harmless sentinel value from .HW and check
+;   whether it lands in the hardware key.
+;
+; Matching policy (frozen): match on the exact hardware ID.
+;   USB\VID_0603&PID_8612&MI_02   is the device identity we want, and it alone.
+;   MI_00 / MI_01 are the UVC streaming + control functions and MUST stay on
+;   Microsoft's usbvideo - this INF never claims them, so video is untouched.
+;
+;   MI_02's interface class triple is 0xFE/01/01 (USB DFU), measured via
+;   `cm400ctl usbprobe`. Documented + install-time sanity check only, not a match
+;   rule: widening the INF beyond the hardware ID buys nothing.
+;
+; No CopyFiles: winusb.sys is the Microsoft inbox driver. We sign only the
+; catalog for this package (per-machine self-signed, see docs/architecture.md
+; section 12); we never sign or ship a .sys of our own.
+; ============================================================================
+
+[Version]
+Signature   = "$Windows NT$"
+Class       = USBDevice
+ClassGuid   = {88bae032-5a81-49f0-bc3d-a4ff138216d6}
+Provider    = %ProviderName%
+CatalogFile = cm400.cat
+DriverVer   = 10/08/2026,0.1.0.10
+; No `PnpLockdown` here. Honest status of that experiment: removing it did NOT fix
+; interface registration, so it was never the cause - see [Motor_Install] below for
+; the actual difference found against the working libwdi package on this machine.
+
+[Manufacturer]
+%ProviderName% = CM400, NTamd64, NTarm64
+
+[CM400.NTamd64]
+%Motor.Desc% = Motor_Install, USB\VID_0603&PID_8612&MI_02
+
+[CM400.NTarm64]
+%Motor.Desc% = Motor_Install, USB\VID_0603&PID_8612&MI_02
+
+; --- Install -----------------------------------------------------------------
+;
+; Class choice is not cosmetic. {88bae032-...} = "Universal Serial Bus devices", the
+; in-box setup class for WinUSB function devices. {36fc9e60-...} is the USB *bus*
+; class; binding a WinUSB function there installs cleanly, loads WinUsb.sys, shows
+; no problem code, and registers NO device interface (measured across three
+; reinstalls). The working libwdi package on this machine uses USBDevice.
+
+[Motor_Install]
+AlsoAddDevice = %Motor.Desc%
+;
+; Copied from the libwdi package that works on this machine. Honest status: this
+; turned out NOT to be the missing piece (tested); it is kept because it matches
+; the known-good reference and is the documented WinUSB pattern.
+Include = winusb.inf
+Needs   = WINUSB.NT
+
+[Motor_Install.Services]
+Include    = winusb.inf
+AddService = WinUSB, 0x00000002, WinUSB_Service_Install, WinUSB_Service_EventLog
+
+; Where the interface GUID has to go: the device's HARDWARE KEY, reached through a
+; .HW diffinstall section. SetupAPI proved .Services and Include/Needs DO run for
+; this INF, yet logged no AddReg processing at all and no error - so the suspect is
+; the AddReg sections' SHAPE, not the section name. Round 3 aligns that shape with
+; the libwdi pattern that verifiably works on this machine: exactly one AddReg
+; section, no comments inside it, GUID supplied via a [Strings] indirection
+; (`HKR,,DeviceInterfaceGUIDs,0x10000,%MotorGuid%`). Sentinel now uses 0x0004
+; (REG_DWORD); 0x0001 as written before is REG_SZ - my error, noted.
+; Round 5, one variable: platform-decorated DDInstall.HW. MS documents
+; [install-section-name.ntamd64.HW] as the form that matches a decorated DDInstall,
+; so the question this asks is simply which spelling SetupAPI resolves here.
+; Note the counter-evidence we are deliberately NOT touching: the undecorated
+; [Motor_Install.Services] demonstrably DID run (its Error Control = 0 is ours),
+; which argues against decoration being the general cause - so this is a test, not
+; a conclusion. And ClassInstall32 is ruled out by the log itself: the class is an
+; existing inbox class, so Windows skips class configuration entirely
+; ("Skipping update of existing inbox class"), which cannot be why .HW is unseen.
+; Final section-name variant, judged at the RIGHT location. The decorated form above
+; was tested against `Device Parameters` and produced nothing, but the undecorated
+; form was only ever judged at the hardware-key ROOT - a location that is not the
+; real target - so it was never validly measured. MS lists both spellings as legal
+; DDInstall.HW names; this round uses the undecorated one, alone, with nothing else
+; changed (same AddReg section, same sentinel, same GUID, same service section).
+; Agreed stop condition: if this fails at Device Parameters too, INF-section variants
+; are exhausted and no further guessing (no ClassInstall32, no co-installers).
+[Motor_Install.HW]
+AddReg = Motor_Hw_AddReg
+
+[Motor_Hw_AddReg]
+HKR,,FriendlyName,,%Motor.Desc%
+HKR,,Cm400HwSentinel,0x0004,1
+HKR,,DeviceInterfaceGUIDs,0x10000,%MotorGuid%
+
+; --- Inbox WinUSB service reference -----------------------------------------
+
+[WinUSB_Service_Install]
+ServiceType    = 1                  ; SERVICE_KERNEL_DRIVER
+StartType      = 3                  ; SERVICE_DEMAND_START
+ErrorControl   = 0                  ; SERVICE_ERROR_IGNORE
+ServiceBinary  = %12%\winusb.sys
+
+[WinUSB_Service_EventLog]
+AddReg = WinUSB_Service_EventLog_AddReg
+
+[WinUSB_Service_EventLog_AddReg]
+HKR,,EventProvider,0x00010001,1
+
+; --- Strings -----------------------------------------------------------------
+
+[Strings]
+ProviderName = "CM400 Driver"
+Motor.Desc   = "CM400 Motor Interface"
+; Must equal CM400_MOTOR_INTERFACE_GUID in crates/cm400-windows/src/lib.rs, whose
+; binary form is GUID::from_u128(0x11a9c0d3_5f2b_4e7a_9c31_0b6d_2e4f_8a10) - the
+; canonical registry spelling of that is 8-4-4-4-12, i.e. the last 16 hex digits of
+; the value form ONE group, not four. The previous line read
+; {11a9c0d3-5f2b-4e7a-9c31-0b6d-2e4f-8a10} (8-4-4-4-4-4-4): WinUSB wrote that into
+; Device Parameters happily and then could not parse it, which is why our own GUID
+; never enumerated an interface while the value being present proved the .HW ran.
+; A unit test now pins INF string == canonical(Rust binary GUID).
+MotorGuid    = "{11a9c0d3-5f2b-4e7a-9c31-0b6d2e4f8a10}"
