@@ -137,6 +137,11 @@ pub struct Ledger {
     attributed: Vec<(u32, u64)>,
     /// Counters for the log, so boundedness is observable rather than assumed.
     pruned_closed: u64,
+    /// Closed records dropped specifically to make room at the cap. Kept apart from
+    /// `pruned_closed` because the two facts mean different things: one is age-based retention
+    /// working as designed, the other is pressure, and under pressure the fast path is exactly what
+    /// must be seen to have survived.
+    closed_reclaimed_on_pressure: u64,
     capacity_resets: u64,
     /// Events dropped because their lifetime provably began before the current observation
     /// boundary, and events dropped for unusable timestamps. Neither may touch `tracked`.
@@ -364,6 +369,16 @@ impl Ledger {
         (self.pruned_closed, self.capacity_resets)
     }
 
+    /// How many closed lifetimes were reclaimed to stay under the cap without resetting the ledger.
+    pub fn pressure_reclaims(&self) -> u64 {
+        self.closed_reclaimed_on_pressure
+    }
+
+    /// How many times the ledger had to invalidate itself entirely.
+    pub fn capacity_reset_count(&self) -> u64 {
+        self.capacity_resets
+    }
+
     /// Drop closed lifetimes older than `RETAIN_CLOSED_MS`.
     ///
     /// Pruning is safe precisely because a later report for a pruned instance finds *no*
@@ -381,17 +396,80 @@ impl Ledger {
         removed
     }
 
-    /// Enforce the hard cap.
+    /// Enforce the hard cap, preferring reclaim over invalidation.
     ///
-    /// The safe action on overflow is to invalidate and start a new observation boundary, not to
-    /// drop entries quietly: a ledger with holes in it must not keep issuing attributions.
-    /// Returns `true` when a reset happened, so the caller can re-snapshot who is alive now.
+    /// Reaching the cap used to mean dropping everything, and that broke the privacy promise on a
+    /// timing accident: a reset moves the observation boundary, the re-seeded entry for a still
+    /// running process is only `SeenAlive`, `SeenAlive` proves no lower bound, so the capture that
+    /// was in flight at that instant can never have its stop attributed and the fast retract is
+    /// lost. Nothing about the process changed; only our bookkeeping did.
+    ///
+    /// So pressure is resolved against the history whose absence is harmless. A closed record exists
+    /// to attribute late reports about a process that already ended; an open one whose start we
+    /// actually saw is the proof that the device is still held by a known instance. Dropping the
+    /// former refuses such a late report with `NoLifetime` - never by borrowing whoever holds the pid
+    /// now - while keeping the latter preserves identity continuity that was already proven rather
+    /// than assumed. The observation boundary is deliberately untouched here: coverage of the stream
+    /// did not change, so no report becomes newly trustworthy or untrustworthy.
+    ///
+    /// A reset still happens when there is nothing safe left to reclaim, i.e. open lifetimes alone
+    /// exceed the cap, and it keeps its explicit untrusted semantics. Returns `true` only for that
+    /// case, so the caller re-snapshots exactly when the ledger really was emptied.
     pub fn enforce_capacity(&mut self, now_ms: u64) -> bool {
         if self.tracked.len() <= MAX_TRACKED {
             return false;
         }
-        self.clear_for_reset(now_ms);
-        true
+        let reclaimable: Vec<(u8, u64, usize)> = self
+            .tracked
+            .iter()
+            .enumerate()
+            .filter_map(|(i, t)| match t.death {
+                // Gone, however imprecisely: a report about it is refused either way.
+                Death::Event { at_ms } => Some((0u8, at_ms, i)),
+                Death::AbsentAt { at_ms, .. } => Some((1u8, at_ms, i)),
+                Death::Unknown => None,
+            })
+            .collect();
+        if self.open_count() > MAX_TRACKED {
+            self.clear_for_reset(now_ms);
+            return true;
+        }
+
+        // Oldest endings first, and stop at a low-water mark rather than at the cap: reclaiming one
+        // record at a time would put us back under pressure on the next arrival.
+        let target = MAX_TRACKED * 3 / 4;
+        let mut oldest_first = reclaimable;
+        oldest_first.sort();
+        let mut drop: Vec<usize> = Vec::new();
+        let mut live = self.tracked.len();
+        for (_, _, i) in oldest_first {
+            if live <= target {
+                break;
+            }
+            drop.push(i);
+            live -= 1;
+        }
+        if drop.is_empty() {
+            // Still over the cap with nothing left to reclaim: say so instead of pretending.
+            self.clear_for_reset(now_ms);
+            return true;
+        }
+        drop.sort_unstable();
+        for i in drop.iter().rev() {
+            self.tracked.remove(*i);
+        }
+        self.closed_reclaimed_on_pressure += drop.len() as u64;
+        // The two side tables are keyed by instance; without this they would outlive the records
+        // they describe and grow without bound.
+        let alive: std::collections::HashSet<(u32, u64)> =
+            self.tracked.iter().map(|t| (t.pid, t.sequence)).collect();
+        self.attributed.retain(|k| alive.contains(k));
+        self.broken.retain(|k| alive.contains(k));
+        debug_assert!(
+            self.tracked.len() <= MAX_TRACKED,
+            "the cap is the point of this function"
+        );
+        false
     }
 
     /// Empty the ledger and move the observation boundary to `now_ms`.
@@ -800,13 +878,15 @@ mod tests {
         );
     }
 
-    /// 16. Hitting the cap must invalidate and re-bound, never silently drop and keep going.
+    /// 16. Hitting the cap must never be a silent partial trim, and the two legitimate outcomes stay
+    ///     distinguishable: reclaim proven-dead history (ledger still trusted, counter moves), or
+    ///     invalidate completely when only live work is left (untrusted, boundary moved).
     #[test]
-    fn capacity_overflow_invalidates_and_rebounds_instead_of_dropping_silently() {
+    fn capacity_overflow_either_reclaims_the_dead_or_invalidates_explicitly() {
         let mut l = Ledger::new();
         l.set_boundary(1_000);
         for i in 0..MAX_TRACKED {
-            // Enough events to exceed the cap; every record is closed so pruning is not involved.
+            // Enough events to exceed the cap; every record is closed so nothing is still in flight.
             l.ingest_start(i as u32 + 1, 7_000 + i as u64, 1_200);
             l.ingest_stop(i as u32 + 1, 7_000 + i as u64, 1_200, 1_300);
         }
@@ -816,25 +896,51 @@ mod tests {
         );
         l.ingest_start(9_999, 8_888, 5_100);
         assert!(
-            l.enforce_capacity(5_200),
-            "over the cap must trigger a reset"
-        );
-        assert_eq!(
-            l.tracked_count(),
-            0,
-            "the ledger is emptied, not partly trimmed"
+            l.tracked_count() > MAX_TRACKED,
+            "over the cap, which must trigger *some* bounded response"
         );
         assert!(
-            l.untrusted(),
-            "and it is explicitly untrusted, not quietly usable"
+            !l.enforce_capacity(5_200),
+            "nothing here is still running, so history is reclaimed instead of the ledger invalidated"
         );
-        assert_eq!(l.trust_reason(), Some("ledger capacity exceeded"));
-        // The new boundary means history from before it cannot be attributed...
-        assert_eq!(l.boundary(), Some(5_200));
-        assert_eq!(
-            l.attribute(&rep(9_999, true, 5_100)),
-            Link::Denied(Denial::LedgerUntrusted("ledger capacity exceeded"))
+        assert!(
+            l.tracked_count() <= MAX_TRACKED,
+            "the cap holds after reclaim: {}",
+            l.tracked_count()
         );
+        assert!(
+            l.pressure_reclaims() > 0,
+            "and the reclaim is observable rather than silent"
+        );
+        assert!(
+            !l.untrusted(),
+            "reclaiming dead history does not invalidate the observation we still hold"
+        );
+        assert_eq!(l.capacity_reset_count(), 0, "no reset was needed");
+        // The live instance keeps exactly the proof it had: a start event, not a re-seeded sighting.
+        assert!(
+            l.attribute(&rep(9_999, true, 5_100)).attributed().is_some(),
+            "the session in flight is still attributable after a pressure reclaim"
+        );
+        // An open-heavy ledger has nothing safe to give up, and must say so instead of trimming.
+        let mut busy = Ledger::new();
+        busy.set_boundary(1_000);
+        for i in 0..=MAX_TRACKED {
+            busy.ingest_start(i as u32 + 1, 7_000 + i as u64, 1_200); // starts only: all open
+        }
+        assert!(
+            busy.open_count() > MAX_TRACKED,
+            "every lifetime is still running: {} open",
+            busy.open_count()
+        );
+        assert!(
+            busy.enforce_capacity(5_200),
+            "only then does the ledger invalidate itself"
+        );
+        assert_eq!(busy.tracked_count(), 0, "emptied, not partly trimmed");
+        assert_eq!(busy.trust_reason(), Some("ledger capacity exceeded"));
+        assert_eq!(busy.boundary(), Some(5_200), "and the boundary moved");
+        assert_eq!(busy.capacity_reset_count(), 1);
     }
 
     /// 17. After a reset, an old instance's late FALSE must not stop the new holder, and a
@@ -1043,6 +1149,142 @@ mod tests {
         assert_eq!(
             l.attribute(&rep(4994, false, 3_000)),
             Link::Denied(Denial::OutsideLifetime { pid: 4994 })
+        );
+    }
+
+    /// 25b. A capture that outlives a pressure reclaim keeps its attributed stop - the incident this
+    ///      fix exists for. Before it, a session in flight when the cap was reached lost the fast
+    ///      path: the reset moved the boundary, the re-seeded entry proved no lower bound, and the
+    ///      stop came back `OutsideLifetime` roughly eight seconds later than it should.
+    #[test]
+    fn an_active_capture_survives_a_capacity_event_and_still_attributes_its_stop() {
+        let mut l = Ledger::new();
+        l.set_boundary(1_000);
+        // The camera process: born by event, still streaming.
+        l.ingest_start(32896, 2847, 447_587);
+        l.note_snapshot_sequence(447_600, 2847);
+        assert_eq!(
+            l.attribute(&rep(32896, true, 447_587)).attributed(),
+            Some(ProcInstance::from_sequence_number(32896, 2847)),
+            "sanity: the running session is attributable before any pressure"
+        );
+        // Churn: unrelated short-lived processes fill the ledger past the cap while it streams.
+        for i in 0..=MAX_TRACKED {
+            l.ingest_start(40_000 + i as u32, 90_000 + i as u64, 448_000 + i as u64);
+            l.ingest_stop(
+                40_000 + i as u32,
+                90_000 + i as u64,
+                448_000 + i as u64,
+                448_100 + i as u64,
+            );
+        }
+        assert!(l.tracked_count() > MAX_TRACKED);
+        assert!(
+            !l.enforce_capacity(470_000),
+            "the camera session is open, so there is something safe to reclaim"
+        );
+        assert!(!l.untrusted(), "and no invalidation was necessary");
+        assert_eq!(l.capacity_reset_count(), 0, "the boundary never moved");
+        assert_eq!(
+            l.boundary(),
+            Some(1_000),
+            "the same observation window still covers this session"
+        );
+        // The stop report of that same session must still be attributable, or the fast retract is lost.
+        assert_eq!(
+            l.attribute(&rep(32896, false, 470_963)).attributed(),
+            Some(ProcInstance::from_sequence_number(32896, 2847)),
+            "stop attributed to the session that was in flight across the capacity event"
+        );
+    }
+
+    /// 25c. What the reclaim does give up, it gives up safely: a late report about a reclaimed
+    ///      instance is refused outright, and a new process under the same pid never inherits it.
+    #[test]
+    fn reclaimed_history_is_refused_and_never_borrowed_by_a_reused_pid() {
+        let mut l = Ledger::new();
+        l.set_boundary(1_000);
+        // A closed session whose record is young enough that only pressure will remove it.
+        l.ingest_start(4994, 111, 1_200);
+        l.note_snapshot_sequence(1_300, 111);
+        l.ingest_stop(4994, 111, 1_200, 1_500);
+        assert!(l.attribute(&rep(4994, false, 1_400)).attributed().is_some());
+        // Push past the cap with closed churn and let pressure reclaim the oldest endings.
+        for i in 0..=MAX_TRACKED {
+            l.ingest_start(50_000 + i as u32, 200_000 + i as u64, 1_600 + i as u64);
+            l.ingest_stop(
+                50_000 + i as u32,
+                200_000 + i as u64,
+                1_600 + i as u64,
+                1_700 + i as u64,
+            );
+        }
+        assert!(
+            !l.enforce_capacity(300_000),
+            "closed history absorbs the pressure"
+        );
+        assert_eq!(
+            l.attribute(&rep(4994, false, 1_400)),
+            Link::Denied(Denial::NoLifetime { pid: 4994 }),
+            "the reclaimed lifetime is gone; the report is refused, not guessed"
+        );
+        // Same pid, new instance: only the new one can be attributed, from its own observed birth.
+        l.ingest_start(4994, 222, 301_000);
+        l.note_snapshot_sequence(301_100, 222);
+        assert_eq!(
+            l.attribute(&rep(4994, true, 302_000)).attributed(),
+            Some(ProcInstance::from_sequence_number(4994, 222)),
+            "identity continuity is not implied by pid equality"
+        );
+    }
+
+    /// 25d. Boundedness under sustained pressure: repeated overflow must never grow past the cap,
+    ///     never lose the live sessions, and never fall back to invalidation while there is dead
+    ///     history left to give up.
+    #[test]
+    fn sustained_pressure_stays_bounded_without_losing_live_sessions_or_trust() {
+        let mut l = Ledger::new();
+        l.set_boundary(1_000);
+        l.ingest_start(7777, 555, 1_100); // one long-running capture, never closed
+        l.note_snapshot_sequence(1_150, 555);
+        let mut resets_seen = 0;
+        for round in 0..6u64 {
+            for i in 0..600u32 {
+                let at = 2_000 + round * 1_000 + i as u64;
+                // A distinct pid per record, not just a distinct sequence: reusing a pid makes
+                // ingest_start close and drop the previous holder, which is exactly the mechanism
+                // that keeps this ledger small in the first place - and it would quietly prevent
+                // the overflow this test exists to exercise.
+                let pid: u32 = 60_000 + round as u32 * 1_000 + i;
+                l.ingest_start(pid, 400_000 + at, at);
+                l.ingest_stop(pid, 400_000 + at, at, at + 10);
+            }
+            if l.enforce_capacity(9_000 + round) {
+                resets_seen += 1;
+            }
+            assert!(
+                l.tracked_count() <= MAX_TRACKED,
+                "round {}: bounded at {}",
+                round,
+                l.tracked_count()
+            );
+        }
+        assert_eq!(
+            resets_seen, 0,
+            "dead history was available every time, so no reset was needed"
+        );
+        assert!(
+            !l.untrusted(),
+            "and the ledger never stopped being able to attribute"
+        );
+        assert!(
+            l.pressure_reclaims() > 0,
+            "the reclaims are counted, not silent"
+        );
+        assert_eq!(
+            l.attribute(&rep(7777, false, 9_500)).attributed(),
+            Some(ProcInstance::from_sequence_number(7777, 555)),
+            "the session that ran through all of it is still attributable"
         );
     }
 

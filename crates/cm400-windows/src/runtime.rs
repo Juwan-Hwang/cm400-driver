@@ -658,6 +658,7 @@ impl ActivityPipeline {
                 }
                 self.last_loss = Some(l);
                 let (pruned, resets) = self.ledger.retention_counters();
+                let reclaimed = self.ledger.pressure_reclaims();
                 let (f_old, f_bad) = self.ledger.filtered_counts();
                 let (t_empty, t_pre) = crate::sam_source::report_time_stats();
                 let h = k.health();
@@ -685,12 +686,13 @@ impl ActivityPipeline {
                     }
                 }
                 Some(format!(
-                    "tracked={} open={} closed={} broken={} pruned={} resets={} filtered_pre_boundary={} filtered_invalid={} sam_time_empty={} sam_time_preepoch={} trusted={} collector_clean={} loss={}/{}/{} buffers={} ok={}/{} unknown_version={} metadata_failed={} missing_field={} type_mismatch={} size_mismatch={} property_read_failed={} implausible={} total={} balanced={} callbacks={} decode_broken={} queue_lost={} consumer_alive={} boundary={}",
+                    "tracked={} open={} closed={} broken={} pruned={} reclaimed={} resets={} filtered_pre_boundary={} filtered_invalid={} sam_time_empty={} sam_time_preepoch={} trusted={} collector_clean={} loss={}/{}/{} buffers={} ok={}/{} unknown_version={} metadata_failed={} missing_field={} type_mismatch={} size_mismatch={} property_read_failed={} implausible={} total={} balanced={} callbacks={} decode_broken={} queue_lost={} consumer_alive={} boundary={}",
                     self.ledger.tracked_count(),
                     self.ledger.open_count(),
                     self.ledger.closed_count(),
                     self.ledger.broken_count(),
                     pruned,
+                    reclaimed,
                     resets,
                     f_old,
                     f_bad,
