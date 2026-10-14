@@ -148,15 +148,32 @@ run on this machine - a real uninstall exited 0 with certificate cleanup driven 
 record, and a reinstall afterwards also exited 0. This is still one machine holding its own only
 working install, so none of it substitutes for a fresh image.
 
-The release status stays **developer / beta** for reasons that are concrete, not procedural:
-(a) no genuinely clean Windows environment has been tested, and (b) the two workflows that now make
-that claim checkable - `.github/workflows/windows.yml` (PR gates) and
-`.github/workflows/release-candidate.yml` (manual signed-candidate acceptance on a clean VM) - have not
-run on GitHub Actions yet, because this repository has no remote. The local gates they encode are green:
-`cargo fmt --all --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`,
-`cargo test --workspace --locked` (265 passed), `cargo check --workspace --all-targets --locked` and
-`git diff --check`. A local green gate is not the same fact as a CI run, and is not written as one.
-What was open on 2026-10-13 morning is now measured: the fast-retract path was re-verified with a **real
+The release status stays **developer / beta** for reasons that are concrete, not procedural, and they are
+now split cleanly. What has become a CI fact: `.github/workflows/windows.yml` is green on the release
+branch head, and `.github/workflows/release-candidate.yml` completed its full two-job acceptance on the
+commit `v0.1.0-rc2` points at - one job reads the draft release (a draft is listable only by a
+push-capable identity, which is why the privileged job checks out nothing, builds nothing and executes
+nothing it downloads) and hands the nine assets over, while the acceptance job holds no credential at all,
+rebuilds the catalog verifier from the pinned toolchain, requires its own checkout to be the commit the
+fetch job validated, verifies the catalog against the pinned public key, refuses a foreign key at
+`VERIFY_SIGNATURE_EX`, runs the tamper self-test and the attack regression against the downloaded
+candidate, and reports the machine unchanged afterwards. The local gates those workflows encode are green
+here too: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`,
+`cargo test --workspace --locked`, `cargo check --workspace --all-targets --locked` and
+`git diff --check`. Counts are left to the runs themselves rather than restated here, because a hard-coded
+total is exactly the kind of claim that goes stale.
+
+What is still **not** proven, and is not written as if it were: no genuinely clean Windows environment has
+been tested - the acceptance runner has no device, so it attests the artefacts and the verification chain,
+not first-install behaviour on hardware - and the candidate daemon bytes have not yet been observed moving
+the lens. Measured on 2026-10-14, the image this development machine actually runs hashes to
+`4808E682B9E47167B2813E088FFFD3DB9AE26F90EA26B4E54D61DB0D9F7DC06E` while the candidate ships
+`BEABA317495C51C0EAC9C4C734316A45E452D1DA85439410C48CC5EBE6FC7FCD`, so the hardware evidence below belongs
+to an earlier build and is not inherited by the candidate bytes until an upgrade installs them and the
+behaviour is observed again.
+
+What was open on 2026-10-13 morning is now measured - on that pre-candidate deployed image, which is the
+correct scope for the claim: the fast-retract path was re-verified with a **real
 camera capture on the deployed image that contains the fix** - the stop was attributed on a trusted
 ledger, the grace waiver fired, `SET(2)` followed the SAM stop report **303 ms** later (the heartbeat
 fallback needs 7-8 s), `LedgerUntrusted` appeared zero times, and the lens reached `physical: Down` with a
