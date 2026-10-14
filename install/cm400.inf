@@ -1,23 +1,30 @@
 ; ============================================================================
 ; CM400 Driver - WinUSB binding for the motor interface (MI_02) ONLY.
 ;
-; STATUS: NOT WORKING, and this is the measured result of Phase 2-D4-B.
-;   Staging (D4-A) and installation (D4-B) both succeeded - device showed
-;   CM_PROB_NONE, Service=WinUSB, our class/provider/friendly-name applied - but NO
-;   WinUSB device interface was ever registered: the hardware key ended up with no
-;   DeviceInterfaceGUIDs value at all, discovery found nothing under either GUID, and
-;   the motor was unreachable. MI_02 has been rolled back to the libwdi package
-;   (install/d4_rollback.ps1). UVC on MI_00 was unaffected throughout.
+; STATUS: working as measured on 2026-10-14. The WinUSB device interface for MI_02 is
+;   registered: a symbolic link ending in the GUID below exists under
+;   HKLM\SYSTEM\CurrentControlSet\Control\DeviceClasses for
+;   USB#VID_0603&PID_8612&MI_02, which is exactly what Phase 2-D4-B could not produce.
+;
+;   History, kept because how this was found matters. D4-B failed, and for a while the
+;   note here described that failure accurately as of its own measurement: the package
+;   staged and installed cleanly, the device showed CM_PROB_NONE with Service=WinUSB, our
+;   class and provider applied, and still no device interface appeared, so MI_02 was rolled
+;   back to the libwdi package at the time.
 ;
 ;   Ruled out by experiment (each plausible, none the cause):
 ;     PnpLockdown=1        -> removed, still no interface
 ;     Include/Needs winusb -> added as libwdi has, still no interface
 ;     Class=USB vs USBDevice -> switched to libwdi's class, still no interface
 ;     needs a restart      -> disable/enable after install, value still absent
-;   Leading untested hypothesis: [Motor_Install.HW] never executes for this INF -
-;   the FriendlyName we asked .HW to write also never appeared in expanded form.
-;   One decisive probe settles it: write a harmless sentinel value from .HW and check
-;   whether it lands in the hardware key.
+;
+;   The leading hypothesis then - that [Motor_Install.HW] never executed - was WRONG. The
+;   registration value was present, which is only possible if .HW ran; what was wrong was
+;   the value's SHAPE. The GUID was written in an 8-4-4-4-4-4-4 grouping, which WinUSB
+;   happily stored into the registry and then could not parse, so no interface was ever
+;   enumerated even though the write proved the section had been processed. See [Strings]
+;   for the canonical form and for the unit test that now pins the INF text to the value
+;   the binary code uses. UVC on MI_00 was unaffected throughout.
 ;
 ; Matching policy (frozen): match on the exact hardware ID.
 ;   USB\VID_0603&PID_8612&MI_02   is the device identity we want, and it alone.
@@ -28,9 +35,9 @@
 ;   `cm400ctl usbprobe`. Documented + install-time sanity check only, not a match
 ;   rule: widening the INF beyond the hardware ID buys nothing.
 ;
-; No CopyFiles: winusb.sys is the Microsoft inbox driver. We sign only the
-; catalog for this package (per-machine self-signed, see docs/architecture.md
-; section 12); we never sign or ship a .sys of our own.
+; No CopyFiles: winusb.sys is the Microsoft inbox driver. We sign only the catalog for
+; this package (self-signed under one fixed release identity, see the architecture notes);
+; we never sign or ship a .sys of our own.
 ; ============================================================================
 
 [Version]
