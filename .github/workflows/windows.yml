@@ -29,6 +29,13 @@ on:
 permissions:
   contents: read
 
+# One run per ref. Work superseded on a branch or a pull request is cancelled rather than queueing Windows
+# runner minutes behind itself, but a run that has already landed on main is never cancelled: that run is
+# part of the record the release reasoning points at, and cancelling it would rewrite history's evidence.
+concurrency:
+  group: windows-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
 jobs:
   quality-and-packaging:
     runs-on: windows-latest
