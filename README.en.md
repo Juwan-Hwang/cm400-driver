@@ -325,6 +325,19 @@ image with no prior CM400 driver or interface registration.
 For the exact claim-by-claim evidence status of every capability, and the release artifact
 whitelist, see **the maintainer-side release notes (RELEASE-READINESS)**.
 
+## Repository protections and how to contribute
+
+`main` is covered by a branch ruleset named `protect-main` (its parameters were read back through the
+GitHub API rather than assumed):
+
+- changes must arrive through a pull request, and merging requires the `quality-and-packaging` check from
+  `windows.yml` to have passed with the branch up to date;
+- the required number of approving reviews is **0**, so a single maintainer is never locked out, and **no
+  bypass actors are configured**;
+- force pushes (non-fast-forward updates) and deletion of `main` are blocked;
+- the repository now requires third-party Actions to be pinned to a full commit SHA, which is why every
+  `uses:` line in the three workflows carries a 40-character SHA rather than a branch name or version tag.
+
 ## License
 
 Apache-2.0.
