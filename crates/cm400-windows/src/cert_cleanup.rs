@@ -1,6 +1,6 @@
 //! Precise removal of the release's own self-signed certificate from the local machine.
 //!
-//! Why this exists: signing is a build-time step (the local d3_sign_catalog tooling) that mints a
+//! Why this exists: signing is a build-time step (`install/d3_sign_catalog.ps1`) that mints a
 //! per-machine self-signed certificate, signs the package catalog, and enrolls the public copy into
 //! `LocalMachine\Root` and `LocalMachine\TrustedPublisher`. An uninstall that leaves it behind keeps
 //! a trusted root on a machine that no longer has the product.

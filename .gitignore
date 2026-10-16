@@ -12,7 +12,7 @@
 w0*_*.ps1
 w0*_*.py
 # catalogs are signed by a PER-MACHINE certificate, so they are never portable:
-# the local d3_sign_catalog tooling regenerates them on the target box. The CDF is
+# install/d3_sign_catalog.ps1 regenerates them on the target box. The CDF is
 # generated too, because a catalog member id is the file's hash - it changes with
 # file contents and must never be pinned in the repo.
 install/*.cat

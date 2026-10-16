@@ -118,6 +118,18 @@ fn main() {
             }
         }
         Some("verify-package") => verify_package_cli(&args[1..]),
+        // Read-only: the same reporter the control tool uses, without opening the motor interface. It
+        // needs no elevation and stages nothing, so it can be run on a machine nobody has touched yet.
+        Some("status") => {
+            for line in cm400_windows::diagnostics::status_lines(
+                &cm400_windows::config::Config::deployed_daemon_path(),
+                false,
+            ) {
+                println!("{line}");
+            }
+        }
+        // The licence copy has to reach the recipient; in a single-file package that means it is inside.
+        Some("--license") | Some("license") => print_license(),
         Some("pinned-identity") => {
             // Read-only, and the reason build scripts stop comparing package files with each other:
             // this is the identity the binary was built to accept.
@@ -134,14 +146,16 @@ fn main() {
                 cm400_windows::cert_cleanup::EXPECTED_SUBJECT
             );
         }
-        Some("uninstall") => uninstall_flow(),
+        Some("uninstall") => uninstall_gated(&args[1..]),
+        // double-clicked, or run with no plan: ask, do not guess
+        None => interactive_flow(),
         _ => {
             eprintln!(
-                "usage:\n  \x20 cm400-setup install   [path\\to\\cm400.inf]\n  \x20 cm400-setup uninstall\n  \x20 cm400-setup harden-acl\n  \x20 cm400-setup verify-package  [path\\to\\cm400.inf]\n  \x20 cm400-setup pinned-identity\n  \x20 cm400-setup install-driver       [path\\to\\cm400.inf]\n  \x20 cm400-setup install-device       [device-instance-id] [provider]\n  \x20 cm400-setup install-device-dif [device-instance-id]\n  \x20 cm400-setup probe\n  \x20 cm400-setup register-guid <guid>\n\n\
+                "usage:\n   cm400-setup                        interactive install or maintenance\n  \x20 cm400-setup install   [path\\to\\cm400.inf]\n   cm400-setup uninstall [--yes]\n   cm400-setup status                   (read-only, no elevation needed)\n   cm400-setup harden-acl\n   cm400-setup verify-package  [path\\to\\cm400.inf]\n   cm400-setup --license\n   cm400-setup pinned-identity\n   cm400-setup install-driver       [path\\to\\cm400.inf]\n   cm400-setup install-device       [device-instance-id] [provider]\n   cm400-setup install-device-dif [device-instance-id]\n   cm400-setup probe\n   cm400-setup register-guid <guid>\n\n\
                  `install` is the product entry point: preflight -> quiesce -> stage + bind ->\n\
                  verify by INTERFACE ENUMERATION (never by an API returning success).\n\
                  It never assumes a third-party rollback package exists, never touches MI_00/MI_01,\n\
-                 and sends no motor command."
+                 and sends no motor command. An unrecognised command is not interpreted."
             );
             std::process::exit(1);
         }
@@ -445,12 +459,57 @@ fn path_ok(p: &std::path::Path) -> bool {
 /// to show all three answers rather than one. A packaging gate read that 0 and shipped a package it
 /// could not verify, so the verdict is now carried by the process result as well as the text.
 fn verify_package_cli(rest: &[OsString]) {
-    let inf = match resolve_inf(rest.first()) {
-        Ok(p) => p,
-        Err(e) => {
+    // A single-file installer is its own package. With no argument, unpack what this executable carries
+    // into a private directory and run the identical judgements over it - the same code path an install
+    // would take, so "verified" means the bytes that would actually have been installed.
+    // A bundle has to be unpacked somewhere before it can be judged, and that place is closed to everyone
+    // except SYSTEM and Administrators on purpose. So verifying a single-file installer is an elevated
+    // action; an ordinary user's check is the published SHA-256 of this one file, compared out of band.
+    // `--staged` says the directory being pointed at came out of a bundle, so the host is legitimately
+    // absent from it. Without the flag the loose rule applies, and a package directory missing its
+    // installer is a real defect - the two must not be conflated by always using the smaller set.
+    let wants_staged = rest.iter().any(|a| a.to_str() == Some("--staged"));
+    let positional: Vec<&OsString> = rest
+        .iter()
+        .filter(|a| a.to_str() != Some("--staged"))
+        .collect();
+    let first = positional.first().copied();
+    let staged = match first {
+        Some(_) => None,
+        None => {
+            if !elevated_now() {
+                eprintln!("cm400-setup: verifying the payload this file carries needs elevation (the staging directory is deliberately writable only by SYSTEM and Administrators).");
+                eprintln!("  as an ordinary user, compare this file's SHA-256 with the value published for the release;");
+                eprintln!("  to verify a loose package instead, pass its INF: cm400-setup verify-package <path>\\cm400.inf");
+                std::process::exit(20);
+            }
+            match stage_bundle() {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("cm400-setup: {e}");
+                    std::process::exit(30);
+                }
+            }
+        }
+    };
+    let inf = match (&staged, first) {
+        (_, Some(p)) => resolve_inf(Some(p)).unwrap_or_else(|e| {
             eprintln!("cm400-setup: {e}");
             std::process::exit(2);
+        }),
+        (Some(s), None) => {
+            let p = s.dir().join("cm400.inf");
+            if !path_ok(&p) {
+                eprintln!("cm400-setup: the staged package carries no cm400.inf");
+                std::process::exit(21);
+            }
+            println!(" package        : staged from the bundle carried by this executable");
+            p
         }
+        (None, None) => resolve_inf(None).unwrap_or_else(|e| {
+            eprintln!("cm400-setup: {e}");
+            std::process::exit(2);
+        }),
     };
     let cat = inf.with_extension("cat");
     let i = inf.to_string_lossy().to_string();
@@ -530,9 +589,54 @@ fn verify_package_cli(rest: &[OsString]) {
         println!("6 crypto vs trust : signature verified and signer is the pinned identity; only this machine's trust stores lack the certificate (install establishes that at deploy time)");
     }
 
+    // judgement 7: do the manifest's digests match the bytes actually present? A signed catalog can
+    // attest that a manifest was signed without the manifest's own claims agreeing with the files beside
+    // it - which is exactly the state a tampered payload with a self-consistent bundle index leaves.
+    // Without this line a package could pass 1-6 while the daemon about to be run is not the one anyone
+    // signed.
+    let pkg_dir = inf
+        .parent()
+        .unwrap_or(std::path::Path::new("."))
+        .to_path_buf();
+    let required: &[&str] = if staged.is_some() || wants_staged {
+        &cm400_windows::artifact_manifest::REQUIRED_STAGED
+    } else {
+        &cm400_windows::artifact_manifest::REQUIRED_FILES
+    };
+    println!(
+        " layout         : {}",
+        if staged.is_some() || wants_staged {
+            "bundled payload (the host is the shipped executable, not a package file)"
+        } else {
+            "loose package (the installer ships beside its package files)"
+        }
+    );
+    let mut digests_wrong = false;
+    if pkg_dir.join("SHA256SUMS.txt").exists() {
+        match cm400_windows::artifact_manifest::verify_dir_with(&pkg_dir, required) {
+            Ok(r) if r.clean() => println!(
+                "7 digests match  : OK  ({} file(s) re-hashed and equal to the manifest)",
+                r.checked
+            ),
+            Ok(r) => {
+                digests_wrong = true;
+                for p in r.problems {
+                    println!("7 digests match  : FAIL - {p}");
+                }
+            }
+            Err(e) => {
+                digests_wrong = true;
+                println!("7 digests match  : FAIL - {e}");
+            }
+        }
+    } else {
+        println!("7 digests match  : NOT PRESENT - no SHA256SUMS.txt beside the package, so nothing was re-hashed");
+    }
+
     let code = if identity_failed {
         31
-    } else if manifest_unattested {
+    } else if manifest_unattested || digests_wrong {
+        // both mean the package's own integrity claims do not hold: one code, distinct lines above
         30
     } else if signature_trust_only {
         39
@@ -541,6 +645,13 @@ fn verify_package_cli(rest: &[OsString]) {
     };
     if code != 0 {
         eprintln!("verify-package: required judgement failed (exit {code})");
+    }
+    // a staged copy is this run's temporary, not the operator's; remove it and say so if that fails
+    if let Some(s) = &staged {
+        if let Err(e) = s.remove() {
+            eprintln!("cm400-setup: staging cleanup FAILED: {e}");
+            eprintln!("  remove this directory by hand: {}", s.dir().display());
+        }
     }
     std::process::exit(code);
 }
@@ -640,12 +751,16 @@ fn report_record_sync(result: Result<cm400_windows::trust_ownership::Record, Vec
 mod deploy_protection_tests {
     use super::*;
 
-    /// The branch above only exercises the refusal on a machine that happens to carry a foreign
-    /// explicit write ACE, so this one manufactures that state and runs everywhere. An explicit grant
-    /// to the account running the test names a trustee the plan does not mention, `/grant:r` therefore
-    /// cannot replace it, and the boundary has to refuse rather than report a hardened directory.
+    /// The branch above only exercises whatever this machine happens to carry, so this one manufactures a
+    /// foreign explicit write ACE and runs everywhere. An explicit grant to the account running the test
+    /// names a trustee the plan does not mention, and `/grant:r` cannot replace it. What must hold either
+    /// way: the plan does not report a hardened directory while that trustee can still write it, and it
+    /// does not lose the two administrative accesses it exists to establish. Whether the foreign entry is
+    /// taken away or the directory is refused depends on the machine, so both outcomes are asserted.
+    /// Rewritten after cloud CI, where a runner's own temp named its installing admin and a refuse-only
+    /// plan made the installer unable to stage on that machine while still reporting the safe verdict.
     #[test]
-    fn a_foreign_explicit_write_ace_makes_the_directory_plan_refuse() {
+    fn a_foreign_explicit_write_ace_is_cleared_or_the_plan_refuses() {
         let dir = std::env::temp_dir().join(format!("cm400-deploy-foreign-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -678,19 +793,39 @@ mod deploy_protection_tests {
             "the manufactured ACE is invisible to the boundary rule, so this test would prove nothing:\n{before}"
         );
 
-        let err = apply_and_verify(&dir, deploy_dir_grants(&dir))
-            .expect_err("granting around a foreign write ACE must not count as hardening the path");
+        // The property is that the plan never leaves the directory open to a writer it does not name: it
+        // takes that access away, or it refuses. Which one happens depends on whether this machine lets the
+        // entry be removed, so both outcomes are asserted on their own terms instead of the test betting on
+        // one machine's ACL. Cloud CI is why: a runner's own temp left its installing admin named there, and
+        // a plan that could only refuse was safe but unable to install anything.
+        let outcome = apply_and_verify(&dir, deploy_dir_grants(&dir));
+        let after = icacls_report(&dir).expect("the DACL must be readable after the plan");
+        let stray_after =
+            cm400_windows::security::unexpected_write_grants(&after, &DEPLOY_ALLOWED_WRITERS);
+        match outcome {
+            Ok(()) => assert!(
+                stray_after.is_empty(),
+                "the plan called this directory protected while a writer it does not name still had access:\n{after}"
+            ),
+            Err(err) => {
+                assert!(
+                    err.contains("unexpected write principals") || err.contains("cannot take write access away"),
+                    "refused for a reason other than the foreign writer: {err}"
+                );
+                assert!(
+                    !stray_after.is_empty(),
+                    "the plan refused, yet the boundary now reads as acceptable - refusal and check disagree:\n{after}"
+                );
+            }
+        }
+        // and whichever way it went, the access the plan exists to establish is still there
         assert!(
-            err.contains("unexpected write principals"),
-            "refused for the wrong reason: {err}"
+            cm400_windows::security::principal_can_write(&after, "NT AUTHORITY\\SYSTEM", false),
+            "SYSTEM lost the access the plan grants:\n{after}"
         );
-        // and the refusal has to be the end of it: the same foreign writer must still be reported, so
-        // no caller can read this as a directory it is safe to leave a service image in
-        let after = icacls_report(&dir).expect("the DACL must still be readable after the refusal");
         assert!(
-            !cm400_windows::security::unexpected_write_grants(&after, &DEPLOY_ALLOWED_WRITERS)
-                .is_empty(),
-            "the refusal left a DACL the boundary would accept:\n{after}"
+            cm400_windows::security::principal_can_write(&after, "BUILTIN\\Administrators", false),
+            "Administrators lost the access the plan grants:\n{after}"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -813,26 +948,62 @@ mod deploy_protection_tests {
             "administrators must still be able to replace it on upgrade"
         );
 
-        // the property in question, demonstrated by attempting it from this process: an un-elevated
-        // user is exactly the principal the boundary has to refuse, so a successful write here would
-        // mean the service image can be replaced by whoever the service then runs
-        let planted = std::fs::write(dir.join("trojan.exe"), b"x").err();
-        let overwritten = std::fs::write(&file, b"replaced").err();
-        assert!(
-            planted.is_some() && overwritten.is_some(),
-            "creating {} or replacing {} must be refused to an ordinary user: planted={planted:?}, overwrite={overwritten:?}",
-            dir.display(),
-            file.display()
-        );
-        // the file that was already there is beyond this principal's reach in both directions: not
-        // writable, and not even readable, because the DACL names only the two administrators and the
-        // service account. Asserting the content from here would require an access the boundary is
-        // designed to refuse, so the refusal itself is what is checked.
-        let peek = std::fs::read(&file).err();
-        assert!(
-            peek.is_some(),
-            "an ordinary user must not be able to read the service image either: {peek:?}"
-        );
+        // The property in question, demonstrated by attempting it from this process - but whether this
+        // process IS an ordinary user is a fact about the account running the test, not about the boundary.
+        // Measured in cloud CI: a runner's test process holds an enabled Administrators group, which is
+        // exactly the principal the plan is supposed to grant, so "my write must be refused" was asserting
+        // one machine's token. Both cases are checked; neither is skipped.
+        if elevated_now() {
+            eprintln!(
+                "branch: this process is an enabled administrator - the principal the plan grants"
+            );
+            // so the refusal cannot be demonstrated from here, and the DACL is asserted instead: the two
+            // administrators hold the access the plan intends and nobody else holds any
+            assert!(
+                cm400_windows::security::principal_can_write(&file_report, "BUILTIN\\Administrators", true),
+                "an enabled administrator must be able to write the image it is granted:\n{file_report}"
+            );
+            let stray = cm400_windows::security::unexpected_write_grants(
+                &file_report,
+                &DEPLOY_ALLOWED_WRITERS,
+            );
+            assert!(
+                stray.is_empty(),
+                "the service image names a writer beyond the two administrators:\n  {}",
+                stray.join("\n  ")
+            );
+            // the directory keeps the same boundary, or the image could be swapped by replacing its parent
+            let dir_report = icacls_report(&dir).unwrap();
+            let stray_dir = cm400_windows::security::unexpected_write_grants(
+                &dir_report,
+                &DEPLOY_ALLOWED_WRITERS,
+            );
+            assert!(
+                stray_dir.is_empty(),
+                "the directory holding the image names a writer beyond the two administrators:\n  {}",
+                stray_dir.join("\n  ")
+            );
+        } else {
+            // an un-elevated process is exactly the principal the boundary has to refuse, so a successful
+            // write here would mean the service image can be replaced by whoever the service then runs
+            let planted = std::fs::write(dir.join("trojan.exe"), b"x").err();
+            let overwritten = std::fs::write(&file, b"replaced").err();
+            assert!(
+                planted.is_some() && overwritten.is_some(),
+                "creating {} or replacing {} must be refused to an ordinary user: planted={planted:?}, overwrite={overwritten:?}",
+                dir.display(),
+                file.display()
+            );
+            // the file that was already there is beyond this principal's reach in both directions: not
+            // writable, and not even readable, because the DACL names only the two administrators and the
+            // service account. Asserting the content from here would require an access the boundary is
+            // designed to refuse, so the refusal itself is what is checked.
+            let peek = std::fs::read(&file).err();
+            assert!(
+                peek.is_some(),
+                "an ordinary user must not be able to read the service image either: {peek:?}"
+            );
+        }
         // who may write the image: the two administrators, and nobody who runs it. A LocalService that
         // could write its own binary turns any daemon compromise into a persistent one.
         for (trustee, want) in [
@@ -1152,11 +1323,17 @@ mod acl_interaction_tests {
 
 /// D5: the product install flow.
 fn install_flow(rest: &[OsString]) {
-    let inf = resolve_inf(rest.first()).unwrap_or_else(|e| {
-        eprintln!("preflight FAIL: {e}");
-        std::process::exit(2)
-    });
-    let cat = inf.with_extension("cat");
+    // The package is resolved in two steps on purpose: an explicit INF from the operator is honoured
+    // immediately, while the default case waits until the bundle this executable carries has been staged
+    // into a private directory and digested. Resolving it earlier would point every gate at a directory
+    // whose bytes nobody had verified yet.
+    let mut inf: PathBuf = match rest.first() {
+        Some(p) => resolve_inf(Some(p)).unwrap_or_else(|e| {
+            eprintln!("preflight FAIL: {e}");
+            std::process::exit(2)
+        }),
+        None => PathBuf::new(),
+    };
 
     // Elevation check. `net session` is NOT a valid probe: it needs the Server service
     // (LanmanServer) to be running and fails even in an elevated process (measured).
@@ -1177,9 +1354,40 @@ fn install_flow(rest: &[OsString]) {
         eprintln!("    ABORT: driver installation requires elevation");
         std::process::exit(20);
     }
+    // [1a] staging happens only in the elevated context, because the directory is deliberately closed to
+    // everyone but SYSTEM and Administrators - a run that is not elevated could not write into it, let
+    // alone keep another process out of it. `stage_bundle` sweeps first, so leftovers from an aborted run
+    // are cleared under the same proofs before this run puts anything down.
+    let staged = match stage_bundle() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("    ABORT: {e}");
+            eprintln!(" nothing was changed by this run.");
+            std::process::exit(30);
+        }
+    };
+    if inf.as_os_str().is_empty() {
+        inf = match &staged {
+            Some(s) => {
+                let p = s.dir().join("cm400.inf");
+                if !path_ok(&p) {
+                    eprintln!("    ABORT: the staged package carries no cm400.inf");
+                    eprintln!(" nothing was changed by this run.");
+                    bail(&staged, 21);
+                }
+                println!("    package        : staged from the bundle carried by this executable");
+                p
+            }
+            None => resolve_inf(None).unwrap_or_else(|e| {
+                eprintln!("preflight FAIL: {e}");
+                bail(&staged, 2)
+            }),
+        };
+    }
+    let cat = inf.with_extension("cat");
     if !path_ok(&inf) || !path_ok(&cat) {
         eprintln!("    ABORT: missing INF or catalog next to it");
-        std::process::exit(21);
+        bail(&staged, 21);
     }
     let cer = inf.with_extension("cer");
     let pkg_dir = inf.parent().map(|p| p.to_path_buf()).unwrap_or_default();
@@ -1189,7 +1397,14 @@ fn install_flow(rest: &[OsString]) {
     // cover a package nobody checked. A missing manifest is refused whenever a `.cer` is present,
     // because that combination is the release flow that establishes trust.
     if pkg_dir.join("SHA256SUMS.txt").exists() {
-        match cm400_windows::artifact_manifest::verify_dir(&pkg_dir) {
+        // a staged bundle carries no copy of the host, so the coverage set is the staged one; a loose
+        // package still has to speak about the installer file shipped beside its INF
+        let required: &[&str] = if staged.is_some() {
+            &cm400_windows::artifact_manifest::REQUIRED_STAGED
+        } else {
+            &cm400_windows::artifact_manifest::REQUIRED_FILES
+        };
+        match cm400_windows::artifact_manifest::verify_dir_with(&pkg_dir, required) {
             Ok(report) if report.clean() => {
                 println!(
                     "    package manifest : {} file(s) verified against SHA256SUMS.txt",
@@ -1201,16 +1416,16 @@ fn install_flow(rest: &[OsString]) {
                     println!("      manifest problem: {problem}");
                 }
                 eprintln!("    ABORT: the package does not match its own manifest");
-                std::process::exit(30);
+                bail(&staged, 30);
             }
             Err(e) => {
                 eprintln!("    ABORT: {e}");
-                std::process::exit(30);
+                bail(&staged, 30);
             }
         }
     } else if path_ok(&cer) {
         eprintln!("    ABORT: cm400.cer is present but SHA256SUMS.txt is not; a release that establishes trust ships both");
-        std::process::exit(30);
+        bail(&staged, 30);
     } else {
         println!("    package manifest : none beside the package (legacy layout); no trust can be established here");
     }
@@ -1220,18 +1435,18 @@ fn install_flow(rest: &[OsString]) {
     // appears in the message, nor against the shipped `.cer` alone.
     if !path_ok(&cer) {
         eprintln!("    ABORT: cm400.cer is required: the pinned publishing identity must be compared with the certificate that signed this catalog");
-        std::process::exit(21);
+        bail(&staged, 21);
     }
     if let Err(e) = cm400_windows::native_trust::catalog_signer(&cat.to_string_lossy()) {
         eprintln!("    ABORT: cannot determine who signed the catalog: {e}");
-        std::process::exit(29);
+        bail(&staged, 29);
     }
     if let Err(errors) = cm400_windows::trust::package_identity_gate(&inf, &cat, &cer) {
         for e in errors {
             eprintln!("      identity: {e}");
         }
         eprintln!("    ABORT: this package is not the release identity this installer was built to accept");
-        std::process::exit(31);
+        bail(&staged, 31);
     }
     println!("    identity         : OK (verified signer and shipped certificate are the pinned identity)");
 
@@ -1245,7 +1460,7 @@ fn install_flow(rest: &[OsString]) {
                 eprintln!("      trust state: {e}");
             }
             eprintln!("    ABORT: a trust store that cannot be enumerated is not a store we may write into");
-            std::process::exit(32);
+            bail(&staged, 32);
         }
     };
     for s in &states {
@@ -1304,7 +1519,7 @@ fn install_flow(rest: &[OsString]) {
                 eprintln!("      trust: {e}");
             }
             eprintln!("    ABORT: local trust for the release identity could not be established and recorded");
-            std::process::exit(33);
+            bail(&staged, 33);
         }
     };
 
@@ -1337,7 +1552,7 @@ fn install_flow(rest: &[OsString]) {
     if !verdict.accepted() {
         undo_trust(cm400_windows::trust::Stage::PackageVerify, &written);
         eprintln!("    ABORT: native trust verification did not pass even after establishing the release identity");
-        std::process::exit(34);
+        bail(&staged, 34);
     }
 
     // [1f] the digest list itself has to be attested. `SHA256SUMS.txt` sitting in the same folder proves
@@ -1351,7 +1566,7 @@ fn install_flow(rest: &[OsString]) {
         ) {
             undo_trust(cm400_windows::trust::Stage::PackageVerify, &written);
             eprintln!("    ABORT: SHA256SUMS.txt is not a member of the signed catalog, so the package contents are unattested: {e}");
-            std::process::exit(30);
+            bail(&staged, 30);
         }
         println!("    manifest signed : OK (SHA256SUMS.txt is a member of the verified catalog)");
     }
@@ -1386,7 +1601,7 @@ fn install_flow(rest: &[OsString]) {
     if published.is_empty() {
         undo_trust(cm400_windows::trust::Stage::DriverStage, &written);
         eprintln!("    ABORT: staging produced no package name");
-        std::process::exit(23);
+        bail(&staged, 23);
     }
     let code = unsafe { run_install_device(MOTOR_INSTANCE, false) };
     println!("    install rc       : {code}");
@@ -1432,7 +1647,7 @@ fn install_flow(rest: &[OsString]) {
         eprintln!("    The driver package is staged and the device may even be bound to it; that");
         eprintln!("    is NOT success. Report this as a failure and leave the machine as it is -");
         eprintln!("    no third-party fallback package is created or assumed here.");
-        std::process::exit(24);
+        bail(&staged, 24);
     }
     println!("[5] ACCEPTED: interface enumerated through our own GUID.");
     // The image the service will run, in a directory the file's own DACL can protect. Registering
@@ -1447,7 +1662,7 @@ fn install_flow(rest: &[OsString]) {
             undo_trust(cm400_windows::trust::Stage::ServiceRegister, &written);
             eprintln!("    ABORT: the service image could not be deployed safely: {e}");
             eprintln!("         nothing was registered or started from an unverified location");
-            std::process::exit(38);
+            bail(&staged, 38);
         }
     };
     service_step(true, &written, &daemon);
@@ -1494,6 +1709,761 @@ fn deploy_dir_grants(path: &std::path::Path) -> Vec<String> {
     )
 }
 
+/// Only the two administrator principals may write a staging directory. It holds the exact bytes that
+/// the catalog gates are about to judge, so an ordinary user must not be able to replace a file inside it
+/// or plant a reparse point: a random directory name is not a defence, a DACL that was read back is.
+fn staging_grants(path: &std::path::Path) -> Vec<String> {
+    grant_argv(path, &["*S-1-5-18:(OI)(CI)F", "*S-1-5-32-544:(OI)(CI)F"])
+}
+
+/// Our own prefix on a staging directory, so a stale one from an aborted run can be recognised without
+/// guessing, and nothing that does not carry it is ever touched.
+const STAGING_PREFIX: &str = "cm400-stage-";
+
+/// Younger than this, a directory belongs to a run that may still be live, and sweeping it would break
+/// somebody else's install rather than clean up after ours.
+const STAGING_MIN_AGE_SECS: u64 = 30 * 60;
+
+fn is_reparse(path: &std::path::Path) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+        path.symlink_metadata()
+            .map(|m| m.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0)
+            .unwrap_or(false)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        false
+    }
+}
+
+/// The temporary directory this process considers its own, resolved. Without canonicalisation a
+/// "leftover" could be pointed at a directory that only looks like a child of TEMP.
+fn canonical_temp() -> PathBuf {
+    std::fs::canonicalize(std::env::temp_dir()).unwrap_or_else(|_| std::env::temp_dir())
+}
+
+/// True only when `path` resolves to a direct child of `parent`. Anything deeper, or redirected by a
+/// reparse point, is not the object the cleaner was written for.
+fn direct_child_of(path: &std::path::Path, parent: &std::path::Path) -> bool {
+    match std::fs::canonicalize(path) {
+        Ok(real) => real.parent() == Some(parent),
+        Err(_) => false,
+    }
+}
+
+/// Is somebody actually at a keyboard? A run started by a script, a scheduled task or a `Start-Process`
+/// without a console has no input to ask for confirmation from - and a destructive command must then
+/// refuse rather than either hang waiting for an answer or proceed without one.
+fn interactive_terminal() -> bool {
+    use std::io::IsTerminal;
+    std::io::stdin().is_terminal()
+}
+
+/// A confirmation that has to be typed. An empty line, EOF, or anything that is not exactly `YES` cancels;
+/// there is no default answer and no timeout that accepts one.
+fn typed_confirmation(question: &str) -> bool {
+    use std::io::Write;
+    println!("  {question}");
+    print!("  type YES to continue, anything else cancels: ");
+    let _ = std::io::stdout().flush();
+    let mut line = String::new();
+    match std::io::stdin().read_line(&mut line) {
+        Ok(_) => line.trim() == "YES",
+        // an unreadable answer is not consent
+        Err(_) => false,
+    }
+}
+
+/// Whether this run can already do the work. The same probe the install flow uses: the right on the
+/// service control manager that the flow needs, not `net session`, which is not an elevation test.
+fn elevated_now() -> bool {
+    windows_service::service_manager::ServiceManager::local_computer(
+        None::<&str>,
+        windows_service::service_manager::ServiceManagerAccess::CONNECT
+            | windows_service::service_manager::ServiceManagerAccess::CREATE_SERVICE,
+    )
+    .is_ok()
+}
+
+/// Ask Windows for one elevation of this same executable, carrying the operation the operator already
+/// confirmed. Only the interactive path uses this: a scripted run must keep receiving the existing
+/// "requires elevation" refusal instead of opening a consent dialog nobody is watching.
+fn relaunch_elevated(operation: &str) -> Result<(), String> {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::Shell::ShellExecuteW;
+    use windows::Win32::UI::WindowsAndMessaging::SHOW_WINDOW_CMD;
+    let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
+    let shown = unsafe {
+        ShellExecuteW(
+            HWND::default(),
+            wp("runas"),
+            wp(&exe.to_string_lossy()),
+            wp(operation),
+            windows::core::PCWSTR::null(),
+            SHOW_WINDOW_CMD(1), // SW_SHOWNORMAL, so the consent dialog is the ordinary one
+        )
+    };
+    // the API reports a handle on success and a small negative-form error code otherwise
+    if shown.0 as isize > 32 {
+        println!("  an elevated window has been started for the {operation} step;");
+        println!("  this window is done and changes nothing by itself.");
+        Ok(())
+    } else {
+        Err(format!(
+            "the elevation request was refused (code {})",
+            shown.0 as isize
+        ))
+    }
+}
+
+/// What `uninstall` will change, stated before asking. An operator cannot confirm something they were
+/// never told, and the certificate step in particular must not look like a general cleanup of the
+/// machine's trust stores.
+fn describe_uninstall_effects() {
+    println!("  uninstalling this product will:");
+    println!("    - stop and remove the CM400Driver service registration;");
+    println!("    - remove the deployed daemon image under C:\\Program Files\\CM400\\bin;");
+    println!(
+        "    - remove the driver package binding for the motor interface this product installed;"
+    );
+    println!(
+        "    - remove ONLY the certificate whose fingerprint, subject, self-signature and DER"
+    );
+    println!("      digest all match this release AND which the ownership record says we added;");
+    println!("    - leave the data directory and its ACL as they are.");
+    println!("  Anything on this machine that is not provably ours is left alone.");
+}
+
+/// The destructive command's gate: explicit `--yes` for non-interactive use, a typed YES otherwise, and
+/// a refusal when neither is available. It never infers consent from a missing answer.
+fn uninstall_gated(args: &[OsString]) {
+    let explicit = args.iter().any(|a| a.to_str() == Some("--yes"));
+    if explicit {
+        println!("  proceeding: the command line carried --yes");
+        uninstall_flow();
+        return;
+    }
+    if !interactive_terminal() {
+        eprintln!("    ABORT: uninstall needs an explicit confirmation and there is no terminal to ask for it.");
+        eprintln!("      run it interactively, or pass --yes when the command is intended.");
+        eprintln!("    nothing was changed by this run.");
+        std::process::exit(28);
+    }
+    describe_uninstall_effects();
+    if !typed_confirmation("Uninstall CM400 from this machine?") {
+        println!("  cancelled; nothing was changed.");
+        return;
+    }
+    uninstall_flow()
+}
+
+/// The maintenance menu shown when the product is already present. There is no default action: an
+/// unreadable answer, an empty line or an unrecognised choice all cancel, because "pressed nothing" is
+/// not an instruction to uninstall somebody's driver.
+fn maintenance_menu(partial: Option<&str>) {
+    if let Some(why) = partial {
+        println!("  the installation is incomplete: {why}");
+        println!(
+            "  repairing re-runs the installer over what is there; it does not remove anything."
+        );
+    }
+    println!("  choose an operation:");
+    println!("    [1] repair or update");
+    println!("    [2] uninstall");
+    println!("    [3] cancel");
+    use std::io::Write;
+    print!("  choice: ");
+    let _ = std::io::stdout().flush();
+    let mut line = String::new();
+    let answer = std::io::stdin()
+        .read_line(&mut line)
+        .map(|_| line.trim().to_string());
+    match answer.as_deref() {
+        Ok("1") => {
+            if !elevated_now() {
+                if let Err(e) = relaunch_elevated("install") {
+                    eprintln!("    ABORT: {e}");
+                    std::process::exit(20);
+                }
+                return;
+            }
+            install_flow(&[])
+        }
+        Ok("2") => uninstall_gated(&[]),
+        // every other answer, including a failed read, cancels
+        _ => println!("  cancelled; nothing was changed."),
+    }
+}
+
+/// No arguments means the file was double-clicked. Decide what is installed from observable facts, tell
+/// the operator what will happen, and ask - never install, overwrite or uninstall by default.
+fn interactive_flow() {
+    use cm400_windows::diagnostics::{install_state, InstallState};
+    match install_state(&cm400_windows::config::Config::deployed_daemon_path()) {
+        InstallState::NotInstalled => {
+            println!("CM400 driver is not installed on this machine.");
+            println!("  installing will:");
+            println!(
+                "    - stage this package's driver and bind only the motor interface (MI_02);"
+            );
+            println!(
+                "    - deploy the daemon to C:\\Program Files\\CM400\\bin and register CM400Driver"
+            );
+            println!("      to run as LocalService with an ACL only SYSTEM and Administrators can write;");
+            println!("    - add this release's certificate to the machine's Root and TrustedPublisher stores,");
+            println!("      after verifying the catalog signature against the identity built into this file.");
+            println!("  UAC will show an unknown publisher: this release is signed with a fixed self-signed");
+            println!("  certificate, not one issued by Microsoft.");
+            if !typed_confirmation("Proceed with the installation?") {
+                println!("  cancelled; nothing was changed.");
+                return;
+            }
+            if !elevated_now() {
+                if let Err(e) = relaunch_elevated("install") {
+                    eprintln!("    ABORT: {e}");
+                    std::process::exit(20);
+                }
+                return;
+            }
+            install_flow(&[])
+        }
+        InstallState::Installed => maintenance_menu(None),
+        InstallState::Partial(why) => maintenance_menu(Some(&why)),
+    }
+}
+
+/// The Apache-2.0 text, carried inside the executable so a single downloaded file can still hand over
+/// the licence copy the licence requires.
+fn print_license() {
+    print!(include_str!("../../../../LICENSE"));
+}
+
+/// What is inside a candidate leftover that a staging directory should never hold.
+///
+/// A staging directory is flat, small, and made only of the payload's own bare file names. Anything
+/// else - a subdirectory, a reparse point, a name with a separator or a colon in it, or a pile of
+/// entries - means this is not the directory we created, however exactly its DACL, owner and age
+/// match. Deciding on the name and the age alone would be deciding on metadata.
+fn structure_problems(dir: &std::path::Path) -> Vec<String> {
+    let mut problems = Vec::new();
+    let read = match std::fs::read_dir(dir) {
+        Ok(r) => r,
+        Err(e) => {
+            problems.push(format!("contents cannot be listed: {e}"));
+            return problems;
+        }
+    };
+    let mut count = 0usize;
+    for entry in read.flatten() {
+        count += 1;
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+            || name.contains(':')
+            || name.contains('\\')
+            || name.contains('/')
+        {
+            problems.push(format!("{name} is not a bare payload file name"));
+        }
+        match entry.file_type() {
+            Ok(t) if t.is_dir() => problems.push(format!("{name} is a directory")),
+            Ok(t) if t.is_symlink() => problems.push(format!("{name} is a symlink")),
+            Ok(_) => {}
+            Err(e) => problems.push(format!("{name} cannot be inspected: {e}")),
+        }
+        if is_reparse(&entry.path()) {
+            problems.push(format!("{name} is a reparse point"));
+        }
+    }
+    if count > 32 {
+        problems.push(format!(
+            "{count} entries is more than a staging directory holds"
+        ));
+    }
+    problems
+}
+
+/// The facts a sweep decision is made from, all of them gathered rather than assumed.
+#[derive(Debug, Clone)]
+struct SweepFacts {
+    name: String,
+    /// None means the age could not be read, which is not permission to delete.
+    age_secs: Option<u64>,
+    reparse: bool,
+    /// The entry must be a direct child of the canonicalised temporary directory this process uses.
+    inside_expected_temp: bool,
+    /// The owner SID, or None when it could not be read.
+    owner_sid: Option<String>,
+    /// The DACL as icacls reports it, or None when it could not be read.
+    dacl: Option<String>,
+    /// The pid our own directory name carries, when the name is the plain `cm400-stage-<pid>` shape.
+    owner_pid: Option<u32>,
+    /// Whether that pid is still running. None means the machine would not say, which is not a licence.
+    pid_alive: Option<bool>,
+    /// What the directory holds that a staging directory should not. Empty means the structure is right.
+    structure: Vec<String>,
+}
+
+/// The package this run unpacked from its own bundle, and the promise that it goes away again.
+#[derive(Debug)]
+pub struct Staged {
+    dir: PathBuf,
+}
+
+impl Staged {
+    fn create(tag: &str) -> Result<Staged, String> {
+        let dir = std::env::temp_dir().join(format!("{STAGING_PREFIX}{tag}"));
+        if dir.symlink_metadata().is_ok() {
+            return Err(format!(
+                "staging directory {} already exists; refusing to reuse it",
+                dir.display()
+            ));
+        }
+        std::fs::create_dir(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+        if let Err(e) = apply_and_verify(&dir, staging_grants(&dir)) {
+            let _ = std::fs::remove_dir(&dir);
+            return Err(format!("staging {} is not private: {e}", dir.display()));
+        }
+        if is_reparse(&dir) {
+            let _ = std::fs::remove_dir(&dir);
+            return Err(format!(
+                "staging {} is a reparse point; refusing to write through it",
+                dir.display()
+            ));
+        }
+        Ok(Staged { dir })
+    }
+
+    pub fn dir(&self) -> &std::path::Path {
+        &self.dir
+    }
+
+    /// Remove the directory and prove it is gone. A cleanup that was merely asked for is not a cleanup.
+    pub fn remove(&self) -> Result<(), String> {
+        if self.dir.symlink_metadata().is_err() {
+            return Ok(());
+        }
+        if is_reparse(&self.dir) {
+            return Err(format!(
+                "{} is a reparse point; deleting it recursively could follow it somewhere else",
+                self.dir.display()
+            ));
+        }
+        std::fs::remove_dir_all(&self.dir)
+            .map_err(|e| format!("cannot remove {}: {e}", self.dir.display()))?;
+        if self.dir.symlink_metadata().is_ok() {
+            return Err(format!(
+                "{} still exists after removal was reported successful",
+                self.dir.display()
+            ));
+        }
+        Ok(())
+    }
+
+    /// SIDs that may own a directory the product created: an elevated interactive install is owned by that
+    /// admin's user SID, a run from the service context by SYSTEM, and a scheduled repair by Administrators.
+    /// Anywhere else, the directory was not made by us.
+    fn owner_is_plausible(owner: Option<&str>, current_user: &str) -> bool {
+        // an empty `current_user` means we could not name our own account, which must not become a wildcard
+        // match for "owned by nobody"
+        matches!(
+            owner,
+            Some(o) if o == "S-1-5-18" || o == "S-1-5-32-544" || (!current_user.is_empty() && o == current_user)
+        )
+    }
+
+    /// The pid encoded in a staging directory name, when the name has the plain shape we give it. A name
+    /// like `cm400-stage-reuse-1234` (a test's own suffix) yields None on purpose: reading a pid out of
+    /// arbitrary text is how a cleaner mistakes somebody else's number for its own.
+    fn pid_in_name(name: &str) -> Option<u32> {
+        name.strip_prefix(STAGING_PREFIX)
+            .and_then(|rest| rest.parse::<u32>().ok())
+    }
+
+    /// Is that pid still running? `None` means the machine would not say, which is never permission to
+    /// delete. Access denied is read as "alive, and not mine to judge", because a process we cannot open
+    /// is more likely somebody's running install than a ghost.
+    fn pid_alive(pid: u32) -> Option<bool> {
+        use windows::Win32::Foundation::{CloseHandle, ERROR_ACCESS_DENIED};
+        use windows::Win32::System::Threading::{
+            GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+        // the exit code Windows reports for a process that has not terminated
+        const STILL_ACTIVE: u32 = 259;
+        unsafe {
+            match OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) {
+                Err(e) => {
+                    if e.code() == ERROR_ACCESS_DENIED.to_hresult() {
+                        None
+                    } else {
+                        // a pid that cannot be opened for any other reason is not a live process
+                        Some(false)
+                    }
+                }
+                Ok(h) => {
+                    let mut code = 0u32;
+                    let got = GetExitCodeProcess(h, &mut code as *mut u32);
+                    let _ = CloseHandle(h);
+                    match got {
+                        Ok(()) => Some(code == STILL_ACTIVE),
+                        Err(_) => None,
+                    }
+                }
+            }
+        }
+    }
+
+    /// Decide, from gathered facts only. Returns Ok(()) for "this is provably ours and it is stale",
+    /// and a reason for every other case so the run can report what it left alone.
+    fn sweep_verdict(f: &SweepFacts, current_user: &str) -> Result<(), String> {
+        if !f.name.starts_with(STAGING_PREFIX) {
+            return Err("not our prefix".to_string());
+        }
+        // an orphan is a directory whose creating process is demonstrably no longer running. That is a
+        // stronger statement than "it is old", and it is why a refused install can stop leaving bytes
+        // lying around for half an hour: the next run recognises the pid in the name we chose is dead.
+        // Our own pid never counts, and a live one never gets swept on age alone.
+        let mine = std::process::id();
+        let orphan = matches!(
+            (f.owner_pid, f.pid_alive),
+            (Some(p), Some(false)) if p != mine
+        );
+        if f.reparse {
+            return Err(
+                "it is a reparse point; recursive deletion could follow it elsewhere".to_string(),
+            );
+        }
+        if !f.inside_expected_temp {
+            return Err("it is not a direct child of the expected temporary directory".to_string());
+        }
+        match f.age_secs {
+            None => {
+                // an unreadable age is survivable only when the run that made the directory is provably
+                // gone; otherwise "could not read" would quietly become permission to delete
+                if !orphan {
+                    return Err(
+                        "its age could not be read and its creating run is not known to be gone"
+                            .to_string(),
+                    );
+                }
+            }
+            Some(a) if a < STAGING_MIN_AGE_SECS && !orphan => {
+                return Err(format!("only {a}s old; a live run may still own it"))
+            }
+            Some(_) => {}
+        }
+        if !Self::owner_is_plausible(f.owner_sid.as_deref(), current_user) {
+            return Err(format!(
+                "its owner is {:?}, which cannot have been created by this product",
+                f.owner_sid
+            ));
+        }
+        let Some(report) = f.dacl.as_deref() else {
+            return Err("its DACL could not be read".to_string());
+        };
+        // the staging shape is exactly the two administrators, both writable, nobody else able to write,
+        // and no ordinary-user ability to create or replace entries
+        for trustee in DEPLOY_ALLOWED_WRITERS {
+            if !cm400_windows::security::principal_can_write(report, trustee, false) {
+                return Err(format!(
+                    "{trustee} cannot write it, so this is not the DACL a staging directory gets"
+                ));
+            }
+        }
+        let foreign =
+            cm400_windows::security::unexpected_write_grants(report, &DEPLOY_ALLOWED_WRITERS);
+        if !foreign.is_empty() {
+            return Err(format!(
+                "its DACL also grants write to {} - an altered boundary, not a leftover of ours",
+                foreign.join(", ")
+            ));
+        }
+        if cm400_windows::security::standard_user_can_perturb(report) {
+            return Err("ordinary users can still create or replace entries inside it".to_string());
+        }
+        if !f.structure.is_empty() {
+            return Err(format!(
+                "its contents are not what a staging directory holds: {}",
+                f.structure.join("; ")
+            ));
+        }
+        Ok(())
+    }
+
+    /// The directory's owner SID, read from the machine rather than assumed. Needed because the name of a
+    /// directory says nothing about who made it.
+    fn owner_sid_of(path: &std::path::Path) -> Option<String> {
+        use windows::core::{PCWSTR, PWSTR};
+        use windows::Win32::Foundation::{LocalFree, HLOCAL, WIN32_ERROR};
+        use windows::Win32::Security::Authorization::{
+            ConvertSidToStringSidW, GetNamedSecurityInfoW, SE_FILE_OBJECT,
+        };
+        use windows::Win32::Security::{OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID};
+        let wide: Vec<u16> = path
+            .to_string_lossy()
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        let mut owner = PSID(std::ptr::null_mut());
+        // the descriptor is an out parameter the API allocates; it is not optional, and it has to be
+        // released or every sweep of every leftover leaks one
+        let mut descriptor = PSECURITY_DESCRIPTOR(std::ptr::null_mut());
+        let code = unsafe {
+            GetNamedSecurityInfoW(
+                PCWSTR(wide.as_ptr()),
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION,
+                Some(&mut owner as *mut PSID),
+                None,
+                None,
+                None,
+                &mut descriptor as *mut PSECURITY_DESCRIPTOR,
+            )
+        };
+        if code != WIN32_ERROR(0) {
+            return None;
+        }
+        let mut text = PWSTR::null();
+        let converted = unsafe { ConvertSidToStringSidW(owner, &mut text as *mut PWSTR) };
+        let sid = if converted.is_ok() {
+            unsafe { text.to_string() }.ok()
+        } else {
+            None
+        };
+        unsafe {
+            // both allocations belong to the API and both have to be handed back
+            if !text.0.is_null() {
+                let _ = LocalFree(HLOCAL(text.0 as *mut _));
+            }
+            if !descriptor.0.is_null() {
+                let _ = LocalFree(HLOCAL(descriptor.0));
+            }
+        }
+        sid
+    }
+
+    /// The SID this process runs as, read from its own access token.
+    ///
+    /// Deliberately not parsed out of `whoami` output. Measured on this machine: the text form carries the
+    /// account and the SID in fields whose labels and separators are localised, and a parser that guessed
+    /// at them produced an empty string - which made every owner look foreign and silently disarmed the
+    /// sweep while still looking like a conservative refusal. The token answers the question directly.
+    ///
+    /// Which "current user" this is matters and is stated: it is the identity of THIS process. On an
+    /// elevated run that is the account UAC actually started the process as - usually the same user SID as
+    /// the interactive login, but not necessarily the same one when elevation was obtained with different
+    /// administrator credentials. That case is handled by refusing, not by widening the set: a directory
+    /// whose owner this process cannot vouch for stays where it is.
+    ///
+    /// An empty return value means the token could not be read. `owner_is_plausible` then narrows to the
+    /// fixed principals rather than matching anything.
+    fn current_user_sid() -> String {
+        use windows::core::PWSTR;
+        use windows::Win32::Foundation::{CloseHandle, LocalFree, HANDLE, HLOCAL};
+        use windows::Win32::Security::Authorization::ConvertSidToStringSidW;
+        use windows::Win32::Security::{GetTokenInformation, TokenUser, PSID, TOKEN_QUERY};
+        use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+        unsafe {
+            let mut token = HANDLE::default();
+            if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token as *mut HANDLE)
+                .is_err()
+            {
+                return String::new();
+            }
+            // TOKEN_USER begins with the SID pointer, so the first pointer-sized word of the buffer is
+            // the value. Building the struct by hand would tie this to a type whose shape the bindings
+            // crate has reshuffled before, and a wrong guess here decides who looks like us.
+            let mut needed = 0u32;
+            let _ = GetTokenInformation(token, TokenUser, None, 0, &mut needed as *mut u32);
+            if needed < (std::mem::size_of::<*mut core::ffi::c_void>() * 2) as u32 {
+                let _ = CloseHandle(token);
+                return String::new();
+            }
+            let mut buf = vec![0u8; needed as usize];
+            let mut used = 0u32;
+            let got = GetTokenInformation(
+                token,
+                TokenUser,
+                Some(buf.as_mut_ptr() as *mut core::ffi::c_void),
+                buf.len() as u32,
+                &mut used as *mut u32,
+            );
+            let _ = CloseHandle(token);
+            if got.is_err()
+                || (used as usize) < std::mem::size_of::<*mut core::ffi::c_void>()
+                || buf.len() < std::mem::size_of::<*mut core::ffi::c_void>()
+            {
+                return String::new();
+            }
+            let owner = PSID(*(buf.as_ptr() as *const *mut core::ffi::c_void));
+            if owner.0.is_null() {
+                return String::new();
+            }
+            let mut text = PWSTR::null();
+            if ConvertSidToStringSidW(owner, &mut text as *mut PWSTR).is_err() {
+                return String::new();
+            }
+            let sid = text.to_string().unwrap_or_default();
+            if !text.0.is_null() {
+                let _ = LocalFree(HLOCAL(text.0 as *mut _));
+            }
+            sid
+        }
+    }
+
+    /// Sweep before doing anything else. Several failure paths inside the install flow terminate the
+    /// process directly, which skips this type's destructor, so a crashed or aborted run would otherwise
+    /// leave verified package bytes on disk indefinitely.
+    ///
+    /// Note what this never does: it does not rewrite a DACL in order to make a deletion succeed. Fixing
+    /// up somebody else's boundary to satisfy our cleaner is how a cleanup primitive becomes a weapon.
+    fn sweep_stale() {
+        let root = std::env::temp_dir();
+        let expected = canonical_temp();
+        let me = Self::current_user_sid();
+        let read = match std::fs::read_dir(&root) {
+            Ok(r) => r,
+            Err(_) => return,
+        };
+        for name in read.filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().to_string()))
+        {
+            if !name.starts_with(STAGING_PREFIX) {
+                continue;
+            }
+            let path = root.join(&name);
+            let meta = std::fs::symlink_metadata(&path);
+            #[cfg(windows)]
+            let reparse = {
+                use std::os::windows::fs::MetadataExt;
+                const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+                match meta {
+                    Ok(ref m) => m.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0,
+                    // a directory we cannot even stat is not one we should delete
+                    Err(_) => true,
+                }
+            };
+            #[cfg(not(windows))]
+            let reparse = true;
+            let age_secs = std::fs::metadata(&path)
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.elapsed().ok())
+                .map(|d| d.as_secs());
+            let facts = SweepFacts {
+                name: name.clone(),
+                age_secs,
+                reparse,
+                inside_expected_temp: direct_child_of(&path, &expected),
+                owner_sid: Self::owner_sid_of(&path),
+                dacl: icacls_report(&path).ok(),
+                owner_pid: Self::pid_in_name(&name),
+                pid_alive: Self::pid_in_name(&name).and_then(Self::pid_alive),
+                structure: structure_problems(&path),
+            };
+            match Self::sweep_verdict(&facts, &me) {
+                Ok(()) => {
+                    let staged = Staged { dir: path };
+                    match staged.remove() {
+                        Ok(()) => println!(" swept a stale staging directory: {name}"),
+                        Err(e) => {
+                            println!(" left a stale staging directory in place ({name}): {e}")
+                        }
+                    }
+                }
+                Err(why) => {
+                    println!(" left {} in place: {why}", path.display());
+                }
+            }
+        }
+    }
+}
+
+impl Drop for Staged {
+    fn drop(&mut self) {
+        if let Err(e) = self.remove() {
+            // never report a cleanup that did not happen
+            eprintln!("cm400-setup: staging cleanup FAILED: {e}");
+            eprintln!("  remove this directory by hand: {}", self.dir.display());
+        }
+    }
+}
+
+/// Leave the install flow through one door.
+///
+/// Every failure after staging has to take this run's private copy with it: the directory holds the exact
+/// bytes the gates just judged, and abandoning them is both clutter and a second copy of a driver package
+/// lying around where something else could find it. Removal is verified, and a removal that could not be
+/// confirmed is named with its path rather than reported as done. The exit code stays the caller's, so
+/// cleaning up never changes what a failure reports.
+fn bail(staged: &Option<Staged>, code: i32) -> ! {
+    if let Some(s) = staged {
+        if let Err(e) = s.remove() {
+            eprintln!("cm400-setup: staging cleanup FAILED: {e}");
+            eprintln!(
+                "  this run left its staged package behind at: {}",
+                s.dir().display()
+            );
+            eprintln!("  it is closed to ordinary users; a later run sweeps it once the creating process is gone");
+        }
+    }
+    std::process::exit(code)
+}
+
+/// Stage and verify the package this executable carries, if it carries one.
+///
+/// `Ok(None)` means "no bundle here, use the loose files as before", which is what every pre-rc4 package
+/// and every CI script expects - including an explicit INF argument, which always outranks the bundle.
+/// A malformed bundle is an error, not a silent fallback: a stripped trailer only downgrades the layout,
+/// it does not weaken a single gate, because the loose-file path still demands a catalog that verifies
+/// against the pinned identity and a manifest that matches the bytes on disk.
+fn stage_bundle() -> Result<Option<Staged>, String> {
+    // anyone who is about to use TEMP for a verified copy first clears what an earlier run left there,
+    // under the full set of proofs below; this is why the policy lives in the staging entry point rather
+    // than only in the install flow
+    Staged::sweep_stale();
+    let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
+    let bundle = match cm400_windows::bundle::Bundle::read(&exe) {
+        Ok(b) => b,
+        Err(e)
+            if e.contains("no CM400 bundle trailer")
+                || e.contains("smaller than a bundle trailer") =>
+        {
+            return Ok(None)
+        }
+        Err(e) => {
+            return Err(format!(
+                "this executable claims to carry a bundle but it cannot be read: {e}"
+            ))
+        }
+    };
+    if !bundle.names().iter().any(|n| n == "cm400.inf") {
+        return Err("the bundle carries no cm400.inf".to_string());
+    }
+    let tag = format!("{}", std::process::id());
+    let staged = Staged::create(&tag)?;
+    // extract_all digests every member before it writes any of them, and re-hashes what landed
+    match bundle.extract_all(&exe, staged.dir()) {
+        Ok(files) => {
+            println!(
+                " staged {} package file(s) into a private directory",
+                files.len()
+            );
+            Ok(Some(staged))
+        }
+        Err(e) => {
+            // `staged` is dropped here, which removes the directory and reports if that failed
+            Err(format!(
+                "the bundle this executable carries does not verify: {e}"
+            ))
+        }
+    }
+}
+
 fn grant_argv(path: &std::path::Path, grants: &[&str]) -> Vec<String> {
     let mut argv = vec![
         path.to_string_lossy().to_string(),
@@ -1523,7 +2493,50 @@ fn apply_and_verify(path: &std::path::Path, argv: Vec<String>) -> Result<(), Str
             out.lines().last().unwrap_or("").trim()
         ));
     }
-    let report = icacls_report(path)?;
+    let mut report = icacls_report(path)?;
+    // A machine whose temp directory hands the installing account an explicit, non-inherited ACE keeps that
+    // entry after `/inheritance:r`, which clears inherited entries only. Measured in cloud CI: a runner's own
+    // temp left its installing admin named on the staging path, so the boundary rule - correctly - refused a
+    // directory the installer had just created. Granting around such an entry would not be hardening, and
+    // refusing is safe but not installable, so the plan takes the access away from the principals it does not
+    // name and then judges the state that actually resulted. Every check below reads the final DACL; none of
+    // them is answered by the DACL as it stood before the removal.
+    for _ in 0..3 {
+        let stray =
+            cm400_windows::security::unexpected_write_grants(&report, &DEPLOY_ALLOWED_WRITERS);
+        let mut names: Vec<String> = Vec::new();
+        for finding in &stray {
+            if let Some((who, _)) = finding.split_once(" holds a write-like right") {
+                let who = who.trim();
+                if !who.is_empty() && !names.iter().any(|n| n == who) {
+                    names.push(who.to_string());
+                }
+            }
+        }
+        if names.is_empty() {
+            // either nothing foreign is left, or the finding could not be named well enough to remove it;
+            // the refusal after the loop treats both honestly rather than assuming the first
+            break;
+        }
+        for who in &names {
+            let argv: Vec<String> = vec![
+                path.to_string_lossy().to_string(),
+                "/remove:g".to_string(),
+                who.clone(),
+            ];
+            let refs: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
+            let (code, out) = run("icacls.exe", &refs);
+            if code != 0 {
+                return Err(format!(
+                    "{}: cannot take write access away from {}: {}",
+                    path.display(),
+                    who,
+                    out.lines().last().unwrap_or("").trim()
+                ));
+            }
+        }
+        report = icacls_report(path)?;
+    }
     let can = |trustee: &str, file: bool| {
         cm400_windows::security::principal_can_write(&report, trustee, file)
     };
@@ -2794,3 +3807,387 @@ unsafe fn write_device_parameters(guid_text: &str) -> i32 {
 }
 
 // Moved out of main(): the previous edit pasted these items inside the match body.
+
+#[cfg(test)]
+mod staging_tests {
+    use super::*;
+
+    fn uniq(tag: &str) -> String {
+        format!("{}-{}", tag, std::process::id())
+    }
+
+    #[test]
+    fn a_host_that_carries_no_bundle_falls_back_to_the_loose_layout() {
+        // the test binary is not bundled, so this must be a plain "no bundle here" and not an error:
+        // every pre-rc4 package and every CI script resolves its package from a directory argument
+        assert!(
+            stage_bundle()
+                .expect("no bundle must not be an error")
+                .is_none(),
+            "an unbundled host must not invent a staged package"
+        );
+    }
+
+    /// The DACL a staging directory actually gets, in the shape icacls prints.
+    const STAGING_DACL: &str = "C:\\Users\\someone\\AppData\\Local\\Temp\\cm400-stage-1: NT AUTHORITY\\SYSTEM:(OI)(CI)(F)\r\n     BUILTIN\\Administrators:(OI)(CI)(F)\r\n";
+
+    /// One extra trustee in the same printed shape, for the case where the boundary was widened.
+    const WIDENED_DACL: &str = "C:\\Users\\someone\\AppData\\Local\\Temp\\cm400-stage-1: NT AUTHORITY\\SYSTEM:(OI)(CI)(F)\r\n     BUILTIN\\Administrators:(OI)(CI)(F)\r\n     MYCORP\\Bob:(OI)(CI)(F)\r\n";
+
+    fn good_facts() -> SweepFacts {
+        SweepFacts {
+            name: format!("{STAGING_PREFIX}1234"),
+            age_secs: Some(STAGING_MIN_AGE_SECS + 10),
+            reparse: false,
+            inside_expected_temp: true,
+            owner_sid: Some("S-1-5-21-1-2-3-1001".to_string()),
+            dacl: Some(STAGING_DACL.to_string()),
+            owner_pid: None,
+            pid_alive: None,
+            structure: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_dead_creating_process_makes_a_young_leftover_sweepable() {
+        // a refused install ends the process without running the destructor's cleanup in every path; the
+        // next run should still be able to tell "that pid is gone" from "that run may be live"
+        let mut f = good_facts();
+        f.name = format!("{STAGING_PREFIX}999998");
+        f.age_secs = Some(5);
+        f.owner_pid = Some(999_998);
+        f.pid_alive = Some(false);
+        assert!(
+            Staged::sweep_verdict(&f, "S-1-5-21-1-2-3-1001").is_ok(),
+            "a provably orphaned directory must not have to sit out the age window: {:?}",
+            f
+        );
+    }
+
+    #[test]
+    fn a_live_creating_process_is_never_swept_and_an_unknown_one_neither() {
+        let mut alive = good_facts();
+        alive.name = format!("{STAGING_PREFIX}999997");
+        alive.age_secs = Some(5);
+        alive.owner_pid = Some(999_997);
+        alive.pid_alive = Some(true);
+        assert!(Staged::sweep_verdict(&alive, "S-1-5-21-1-2-3-1001").is_err());
+        // the machine would not say: still no licence, even when the age is unreadable too
+        let mut unknown = alive.clone();
+        unknown.pid_alive = None;
+        unknown.age_secs = None;
+        let err = Staged::sweep_verdict(&unknown, "S-1-5-21-1-2-3-1001")
+            .expect_err("an unknown liveness must not become permission");
+        assert!(err.contains("creating run"), "unhelpful: {err}");
+    }
+
+    #[test]
+    fn our_own_pid_is_never_treated_as_a_dead_one() {
+        // impossible in reality, but the rule must not depend on that: our own staging directory belongs to
+        // the run that is answering this question
+        let mut f = good_facts();
+        let me = std::process::id();
+        f.name = format!("{STAGING_PREFIX}{me}");
+        f.age_secs = None;
+        f.owner_pid = Some(me);
+        f.pid_alive = Some(false);
+        assert!(
+            Staged::sweep_verdict(&f, "S-1-5-21-1-2-3-1001").is_err(),
+            "our own live directory must never be swept as an orphan"
+        );
+    }
+
+    #[test]
+    fn a_name_that_is_not_a_plain_pid_is_read_by_age_alone() {
+        assert_eq!(Staged::pid_in_name("cm400-stage-4321"), Some(4321));
+        assert_eq!(Staged::pid_in_name("cm400-stage-reuse-4321"), None);
+        assert_eq!(Staged::pid_in_name("cm400-stage-"), None);
+    }
+
+    #[test]
+    fn this_process_can_name_its_own_sid_without_reading_any_text() {
+        // the sweep's owner test depends on this being a real SID, not a parse of localised tool output
+        let me = Staged::current_user_sid();
+        assert!(
+            me.starts_with("S-1-") && me.matches('-').count() >= 3,
+            "the token did not yield a SID: {me:?}"
+        );
+        // and the owner read has to agree with the sweep's rule for something this process created itself.
+        // Equality with the token SID is NOT the property, and asserting it was the bug: measured in cloud
+        // CI, a runner's directory came back owned by BUILTIN\Administrators rather than by the account that
+        // made it - a normal Windows outcome for an administrative token, and still provably this run's own.
+        let dir = std::env::temp_dir().join(format!("cm400-ownsid-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let owner = Staged::owner_sid_of(&dir);
+        std::fs::remove_dir(&dir).ok();
+        let owner =
+            owner.unwrap_or_else(|| panic!("the owner of a directory we created is unreadable"));
+        assert!(
+            owner.starts_with("S-1-"),
+            "the owner did not read back as a SID: {owner:?}"
+        );
+        assert!(
+            Staged::owner_is_plausible(Some(owner.as_str()), &me),
+            "our own directory is not recognisable as ours: owner {owner:?}, token {me:?}"
+        );
+    }
+
+    #[test]
+    fn an_administrator_that_is_not_us_is_still_foreign() {
+        // the UAC-with-different-credentials case: another real admin SID must not become plausible just
+        // because it is an administrator
+        assert!(!Staged::owner_is_plausible(
+            Some("S-1-5-21-999-999-999-500"),
+            "S-1-5-21-1-2-3-1001"
+        ));
+        assert!(Staged::owner_is_plausible(
+            Some("S-1-5-32-544"),
+            "S-1-5-21-1-2-3-1001"
+        ));
+    }
+
+    #[test]
+    fn an_unexpected_entry_inside_the_directory_ends_the_ownership_claim() {
+        let dir = std::env::temp_dir().join(format!("cm400-struct-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(
+            structure_problems(&dir).is_empty(),
+            "an empty directory is fine"
+        );
+        std::fs::write(dir.join("cm400d.exe"), b"x").unwrap();
+        assert!(
+            structure_problems(&dir).is_empty(),
+            "a payload file is fine"
+        );
+        std::fs::create_dir(dir.join("sub")).unwrap();
+        let problems = structure_problems(&dir);
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.contains("sub") && p.contains("directory")),
+            "a subdirectory must end the claim: {problems:?}"
+        );
+        std::fs::remove_dir_all(dir.join("sub")).ok();
+        // legal on Windows but never a name the bundle could carry (a space). A colon would be rejected
+        // by the filesystem itself, so writing `weird:name` proves nothing about this rule.
+        std::fs::write(dir.join("pay load.exe"), b"x").unwrap();
+        let problems = structure_problems(&dir);
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.contains("bare payload file name")),
+            "a name that is not a bare file must be reported: {problems:?}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+
+        // and a directory that fails only on structure is refused even with a perfect DACL, owner and age
+        let mut f = good_facts();
+        f.structure = vec!["nested is a directory".to_string()];
+        let err = Staged::sweep_verdict(&f, "S-1-5-21-1-2-3-1001")
+            .expect_err("contents the product would not put there must stop the cleaner");
+        assert!(err.contains("contents"), "unhelpful: {err}");
+    }
+
+    #[test]
+    fn an_unknown_current_sid_makes_every_owner_foreign() {
+        // fail closed: not knowing who we are must never turn into "the owner matches us"
+        assert!(!Staged::owner_is_plausible(Some(""), ""));
+        assert!(
+            Staged::owner_is_plausible(Some("S-1-5-18"), ""),
+            "SYSTEM is always a plausible creator"
+        );
+        assert!(Staged::owner_is_plausible(
+            Some("S-1-5-21-1-2-3-1001"),
+            "S-1-5-21-1-2-3-1001"
+        ));
+        assert!(!Staged::owner_is_plausible(
+            Some("S-1-5-21-9-9-9-1001"),
+            "S-1-5-21-1-2-3-1001"
+        ));
+    }
+
+    #[test]
+    fn a_directory_we_can_prove_is_ours_and_stale_is_swept() {
+        assert!(
+            Staged::sweep_verdict(&good_facts(), "S-1-5-21-1-2-3-1001").is_ok(),
+            "the normal leftover case must not be refused, or stale verified bytes pile up in TEMP"
+        );
+    }
+
+    #[test]
+    fn a_forged_name_with_an_unexpected_owner_is_never_swept() {
+        let mut f = good_facts();
+        f.owner_sid = Some("S-1-5-21-9-9-9-4242".to_string());
+        let err = Staged::sweep_verdict(&f, "S-1-5-21-1-2-3-1001")
+            .expect_err("a name we recognise is not an ownership proof");
+        assert!(err.contains("owner"), "unhelpful: {err}");
+        // SYSTEM and Administrators are legitimate owners of a directory the product created
+        for sid in ["S-1-5-18", "S-1-5-32-544"] {
+            let mut ours = good_facts();
+            ours.owner_sid = Some(sid.to_string());
+            assert!(Staged::sweep_verdict(&ours, "S-1-5-21-1-2-3-1001").is_ok());
+        }
+        // and an owner that cannot be read is not a licence to delete either
+        let mut unknown = good_facts();
+        unknown.owner_sid = None;
+        assert!(Staged::sweep_verdict(&unknown, "S-1-5-21-1-2-3-1001").is_err());
+    }
+
+    #[test]
+    fn a_reparse_point_is_never_swept_recursively() {
+        let mut f = good_facts();
+        f.reparse = true;
+        let err = Staged::sweep_verdict(&f, "S-1-5-21-1-2-3-1001")
+            .expect_err("deleting through a reparse point removes what it points at");
+        assert!(err.contains("reparse"), "unhelpful: {err}");
+    }
+
+    #[test]
+    fn an_unreadable_age_is_treated_as_a_live_run() {
+        let mut f = good_facts();
+        f.age_secs = None;
+        assert!(
+            Staged::sweep_verdict(&f, "S-1-5-21-1-2-3-1001").is_err(),
+            "unknown age must not become permission"
+        );
+        let mut young = good_facts();
+        young.age_secs = Some(STAGING_MIN_AGE_SECS - 1);
+        assert!(Staged::sweep_verdict(&young, "S-1-5-21-1-2-3-1001").is_err());
+    }
+
+    #[test]
+    fn a_directory_outside_the_expected_temp_is_not_swept() {
+        let mut f = good_facts();
+        f.inside_expected_temp = false;
+        let err = Staged::sweep_verdict(&f, "S-1-5-21-1-2-3-1001")
+            .expect_err("canonical containment is checked, not assumed from the path string");
+        assert!(err.contains("temporary directory"), "unhelpful: {err}");
+    }
+
+    #[test]
+    fn an_altered_dacl_is_left_alone_instead_of_being_fixed_then_deleted() {
+        // a stranger granted write: this is not the boundary a staging directory gets
+        let mut f = good_facts();
+        f.dacl = Some(WIDENED_DACL.to_string());
+        let err = Staged::sweep_verdict(&f, "S-1-5-21-1-2-3-1001")
+            .expect_err("a rewritten DACL must stop the cleaner, not be repaired by it");
+        assert!(err.contains("DACL"), "unhelpful: {err}");
+        // and a DACL that lost the administrators' right, or cannot be read at all
+        let mut stripped = good_facts();
+        stripped.dacl = Some("C:\\x: NT AUTHORITY\\SYSTEM:(RX)\r\n".to_string());
+        assert!(Staged::sweep_verdict(&stripped, "S-1-5-21-1-2-3-1001").is_err());
+        let mut unreadable = good_facts();
+        unreadable.dacl = None;
+        assert!(Staged::sweep_verdict(&unreadable, "S-1-5-21-1-2-3-1001").is_err());
+    }
+
+    #[test]
+    fn a_name_that_is_not_ours_is_not_even_examined() {
+        let mut f = good_facts();
+        f.name = "node_modules".to_string();
+        assert!(Staged::sweep_verdict(&f, "S-1-5-21-1-2-3-1001").is_err());
+        f.name = "cm400-stage-sibling-but-deeper".to_string();
+        assert!(
+            Staged::sweep_verdict(&f, "S-1-5-21-1-2-3-1001").is_ok(),
+            "our prefix still matches"
+        );
+    }
+
+    #[test]
+    fn create_refuses_to_reuse_a_directory_that_already_exists() {
+        let tag = uniq("reuse");
+        let dir = std::env::temp_dir().join(format!("{STAGING_PREFIX}{tag}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let err = Staged::create(&tag)
+            .expect_err("reusing a directory would let one run judge another's bytes");
+        assert!(err.contains("already exists"), "unhelpful failure: {err}");
+        assert!(
+            std::fs::remove_dir(&dir).is_ok() || !dir.exists(),
+            "test left {} behind",
+            dir.display()
+        );
+    }
+
+    #[test]
+    fn a_staged_directory_is_closed_to_everyone_but_the_two_administrators() {
+        // measured, and it is the property rather than a limitation: an unelevated run cannot even
+        // delete the staging directory it created, so nothing outside SYSTEM and Administrators can
+        // replace or remove the bytes the catalog gates are about to judge
+        let tag = uniq("dacl");
+        let staged =
+            Staged::create(&tag).expect("create must succeed on a directory this run owns");
+        let report = icacls_report(staged.dir()).expect("the DACL must be readable back");
+        assert!(
+            !cm400_windows::security::standard_user_can_perturb(&report),
+            "ordinary users may perturb the staging directory:\n{report}"
+        );
+        for trustee in DEPLOY_ALLOWED_WRITERS {
+            assert!(
+                cm400_windows::security::principal_can_write(&report, trustee, false),
+                "{trustee} must be able to manage the staging directory so the elevated installer can clean it up"
+            );
+        }
+        // let this (unelevated) test process take the directory back so the test leaves nothing behind;
+        // an installer running elevated already holds what this call only simulates
+        let ours = whoami_sid();
+        let mut grants = staging_grants(staged.dir());
+        if let Some(sid) = ours {
+            grants.push(format!("*{sid}:(OI)(CI)F"));
+        }
+        apply_and_verify(staged.dir(), grants).ok();
+        staged.remove().ok();
+    }
+
+    fn whoami_sid() -> Option<String> {
+        let (code, out) = run("whoami.exe", &["/user", "/sid"]);
+        if code != 0 {
+            return None;
+        }
+        out.lines()
+            .map(|l| l.trim().to_string())
+            .find(|l| l.starts_with("S-1-"))
+    }
+    #[test]
+    fn removal_reports_failure_instead_of_claiming_success() {
+        // point it at a regular file: remove_dir_all cannot do that, and the call must say so rather
+        // than returning Ok and letting the installer believe the bytes are gone
+        let dir = std::env::temp_dir().join(format!("{STAGING_PREFIX}{}", uniq("asfile")));
+        std::fs::write(&dir, b"x").unwrap();
+        let staged = Staged { dir: dir.clone() };
+        assert!(
+            staged.remove().is_err(),
+            "a path that is not our directory must not be reported as cleaned"
+        );
+        std::fs::remove_file(&dir).ok();
+    }
+
+    #[test]
+    fn a_removal_that_cannot_finish_is_reported_and_not_claimed_as_done() {
+        // the cleanup path must not turn "I could not delete this" into success; an unelevated process is
+        // denied on its own staging directory, which is exactly the state a real abort can leave
+        let tag = uniq("leak");
+        let staged = Staged::create(&tag).expect("create");
+        let dir = staged.dir().to_path_buf();
+        let first = staged.remove();
+        match first {
+            Err(e) => {
+                // refused: prove the directory is still there, so the operator can act on the warning
+                assert!(
+                    dir.exists(),
+                    "a refused cleanup must not have half-deleted the directory: {e}"
+                );
+                let ours = whoami_sid();
+                let mut grants = staging_grants(&dir);
+                if let Some(sid) = ours {
+                    grants.push(format!("*{sid}:(OI)(CI)F"));
+                }
+                apply_and_verify(&dir, grants).ok();
+                std::fs::remove_dir_all(&dir).ok();
+            }
+            Ok(()) => {
+                assert!(!dir.exists(), "removed must mean removed");
+            }
+        }
+    }
+}

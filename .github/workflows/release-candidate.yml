@@ -58,7 +58,7 @@ jobs:
       tag-sha: ${{ steps.read.outputs.tagsha }}
     steps:
       - id: read
-        name: read the draft release and download the nine assets
+        name: read the draft release and download the single asset
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: pwsh
@@ -73,11 +73,6 @@ jobs:
             Write-Host '::error::refusing an unexpected tag value; a candidate tag is not a download URL'
             exit 2
           }
-          # the release notes or an unrelated tool must not become package content by accident
-          $expected = @(
-            'LICENSE', 'SHA256SUMS.txt', 'cm400.cat', 'cm400.cat.thumbprint.txt', 'cm400.cer',
-            'cm400-setup.exe', 'cm400.inf', 'cm400ctl.exe', 'cm400d.exe'
-          )
           # Measured, and the reason this is not `releases/tags/{tag}`: that endpoint answers 404 for a
           # draft, because a draft is deliberately not resolvable by tag name. Listing releases does see
           # drafts, but only for an identity with push access - which is why this job exists and the
@@ -88,16 +83,6 @@ jobs:
             Write-Host $release
             exit 2
           }
-          $matches = @($release | ConvertFrom-Json | Where-Object { $_.tag_name -eq $tag })
-          if ($matches.Count -ne 1) {
-            Write-Host "::error::expected exactly one release for tag '$tag', found $($matches.Count); a candidate has to be published as a Draft Release first"
-            exit 2
-          }
-          $rel = $matches[0]
-          if (-not $rel.draft) {
-            Write-Host "::error::the release for '$tag' is not a draft; this job judges candidates, not published releases"
-            exit 2
-          }
           # the tag's own object, not `target_commitish`, which can name a branch that has since moved
           $tagRef = gh api "repos/$env:GITHUB_REPOSITORY/git/ref/tags/$tag" 2>&1
           if ($LASTEXITCODE -ne 0) { Write-Host "::error::the candidate tag could not be read: $tagRef"; exit 2 }
@@ -105,23 +90,24 @@ jobs:
           if (-not $tagSha) { Write-Host '::error::the candidate tag carries no commit'; exit 2 }
           "tagsha=$tagSha" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
           Write-Host "  candidate   : tag $tag -> $tagSha (job commit $env:GITHUB_SHA)"
+          # Every judgement about the release itself - exactly one release for the tag, still a draft, the
+          # asset set and how many assets a release may carry, uploaded state, advertised sizes and server
+          # digests - lives in install/candidate_release_assert.ps1, the same script the local candidate
+          # simulation drives. A step that re-implemented them here would only prove that two copies of the
+          # same idea agree with each other.
+          .\install\candidate_release_assert.ps1 -ReleaseJson $release -Tag $tag -TagSha $tagSha -JobSha $env:GITHUB_SHA
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::error::the release record is not an acceptable candidate (code $LASTEXITCODE)"
+            exit $LASTEXITCODE
+          }
+          $rel = @($release | ConvertFrom-Json | Where-Object { $_.tag_name -eq $tag })[0]
           Write-Host "  release     : $($rel.name) (id=$($rel.id), draft=$($rel.draft), prerelease=$($rel.prerelease))"
-          $assets = @($rel.assets)
-          $names = @($assets | ForEach-Object { $_.name })
-          $dupes = @($names | Group-Object | Where-Object { $_.Count -gt 1 })
-          $unknown = @($names | Where-Object { $expected -notcontains $_ })
-          $absent = @($expected | Where-Object { $names -notcontains $_ })
-          if ($assets.Count -ne 9) { Write-Host "::error::expected nine assets, found $($assets.Count)"; exit 2 }
-          if ($dupes.Count) { Write-Host "::error::duplicate asset names: $($dupes.Name -join ', ')"; exit 2 }
-          if ($unknown.Count) { Write-Host "::error::assets that are not package content: $($unknown -join ', ')"; exit 2 }
-          if ($absent.Count) { Write-Host "::error::missing package files: $($absent -join ', ')"; exit 2 }
-          foreach ($a in $assets) {
-            if ($a.state -ne 'uploaded') { Write-Host "::error::asset $($a.name) is in state '$($a.state)', not uploaded"; exit 2 }
-            if (-not $a.size) { Write-Host "::error::asset $($a.name) reports no size"; exit 2 }
-            # Measured: `gh api` has no --output flag, so it printed its usage and wrote nothing at all.
-            # The download is therefore done explicitly - and without the `Accept: application/json`
-            # default, which would have stored API metadata under the file's name instead of content.
+          # the download itself stays here: only this job holds a token, and fetching bytes is not a judgement
+          foreach ($a in @($rel.assets)) {
             $dest = Join-Path $env:PACKAGE_DIR $a.name
+            # Measured: `gh api` has no --output flag, so it printed its usage and wrote nothing at all. The
+            # download is therefore done explicitly - and without the `Accept: application/json` default,
+            # which would have stored API metadata under the file's name instead of content.
             $headers = @{
               Authorization = "Bearer $env:GH_TOKEN"
               Accept        = 'application/octet-stream'
@@ -135,21 +121,16 @@ jobs:
               exit 2
             }
             if (-not (Test-Path $dest)) { Write-Host "::error::$($a.name) was not written"; exit 2 }
-            # GitHub's own digest for the stored bytes against a hash of the bytes that arrived: two
-            # independent measurements, not one number this step produced and then re-read
-            if (-not $a.digest) { Write-Host "::error::asset $($a.name) carries no server-side digest"; exit 2 }
-            $local = (Get-FileHash (Join-Path $env:PACKAGE_DIR $a.name) -Algorithm SHA256).Hash.ToLowerInvariant()
-            $remote = $a.digest -replace '^sha256:', ''
-            if ($local -ne $remote) {
-              Write-Host "::error::asset $($a.name) digest mismatch: server says $remote, downloaded file is $local"
-              exit 2
-            }
-            Write-Host ("  fetched     : {0} ({1} bytes on disk, {2} advertised) sha256={3} matches the release record" -f `
-              $a.name, (Get-Item $dest).Length, $a.size, $local.Substring(0, 16))
           }
-          if (@(Get-ChildItem $env:PACKAGE_DIR -File).Count -ne 9) {
-            Write-Host '::error::the downloaded set is not exactly nine files'
-            exit 2
+          # and the transport judgement, by the same script that judged the record: GitHub's own digest for
+          # the stored bytes against a hash of the bytes that arrived, advertised size against the file on
+          # disk, and the exact file count. What this observer measured is recorded OUTSIDE the package
+          # directory, so the credential-less job compares two independent measurements rather than its own.
+          New-Item -ItemType Directory -Force -Path "$env:GITHUB_WORKSPACE\meta" | Out-Null
+          .\install\candidate_release_assert.ps1 -ReleaseJson $release -Tag $tag -TagSha $tagSha -JobSha $env:GITHUB_SHA -PackageDir $env:PACKAGE_DIR -RecordShaTo "$env:GITHUB_WORKSPACE\meta\asset-sha256.txt"
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::error::the delivered asset is not what the release record describes (code $LASTEXITCODE)"
+            exit $LASTEXITCODE
           }
 
       - name: hand the candidate to the acceptance job
@@ -162,12 +143,26 @@ jobs:
           # artifact short-lived (one day) bounds how long the candidate bytes sit retrievable
           retention-days: 1
 
+      # the fetch job's own observation of the asset hash, in a separate artifact: it is not package
+      # content and must never land in the directory the gates judge
+      - name: hand the recorded asset digest to the acceptance job
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: candidate-meta
+          path: ${{ github.workspace }}\meta\asset-sha256.txt
+          if-no-files-found: error
+          retention-days: 1
+
   clean-vm-acceptance:
     runs-on: windows-latest
     timeout-minutes: 30
     needs: fetch-candidate
     env:
       PACKAGE_DIR: ${{ github.workspace }}\candidate
+      # the payload inside the shipped installer, expanded by the acceptance job itself with a tool built
+      # from this checkout. Kept separate from PACKAGE_DIR so no step can mistake the working copy for
+      # what was delivered.
+      PAYLOAD_DIR: ${{ github.workspace }}\payload
       LOG_DIR: ${{ github.workspace }}\logs
       # This job holds no credential at all: the candidate arrives as an artifact from the fetch job, so
       # nothing that builds, tests, or executes downloaded content can reach a token - blanking the
@@ -199,7 +194,7 @@ jobs:
           GH_TOKEN: ''
         shell: pwsh
         run: |
-          cargo build --release --locked --bin cm400-catsig
+          cargo build --release --locked --bin cm400-catsig --bin cm400-bundle
           if ($LASTEXITCODE -ne 0) {
             Write-Host '::error::the verifier could not be built; the candidate cannot be accepted'
             exit 1
@@ -214,6 +209,12 @@ jobs:
           }
           "CATSIG=$exe" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           Write-Host "  verifier built at $exe"
+          # the same rule as the verifier: the thing that opens the candidate's container is built from this
+          # checkout, not taken from the candidate, and it is never a release asset either
+          $bt = if ($env:CARGO_TARGET_DIR) { Join-Path $env:CARGO_TARGET_DIR 'release\cm400-bundle.exe' } else { Join-Path $env:GITHUB_WORKSPACE 'target\release\cm400-bundle.exe' }
+          if (-not (Test-Path $bt)) { Write-Host '::error::cm400-bundle.exe was not produced; a bundled candidate cannot be opened'; exit 1 }
+          "BUNDLE_TOOL=$bt" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "  bundle tool built at $bt"
 
       # The candidate arrives from the fetch job, and this job never sees a token: receiving it as an
       # artifact means the write-capable credential and the code that executes the candidate are in
@@ -228,6 +229,12 @@ jobs:
         with:
           name: candidate-assets
           path: ${{ runner.temp }}\candidate-in
+
+      - name: receive the recorded asset digest
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: candidate-meta
+          path: ${{ runner.temp }}\meta-in
 
       - name: flatten the artifact into the package directory
         shell: pwsh
@@ -256,37 +263,29 @@ jobs:
           }
           Write-Host "  source : $env:GITHUB_SHA, matching the candidate tag"
 
-      - name: the delivered set is still exactly the nine assets
+      - name: the delivered asset is the one file, and its payload is what it claims
         shell: pwsh
         run: |
-          # Re-count and re-hash after a second transport. The package carries its own digest list, so the
-          # files are checked against something inside the candidate rather than against a value this step
-          # just produced: an artifact that arrived altered must not pass because nobody looked.
-          $expected = @(
-            'LICENSE', 'SHA256SUMS.txt', 'cm400.cat', 'cm400.cat.thumbprint.txt', 'cm400.cer',
-            'cm400-setup.exe', 'cm400.inf', 'cm400ctl.exe', 'cm400d.exe'
-          )
-          $have = @(Get-ChildItem $env:PACKAGE_DIR -File)
-          $extra = @($have | ForEach-Object { $_.Name } | Where-Object { $expected -notcontains $_ })
-          $missing = @($expected | Where-Object { $_ -notin @($have | ForEach-Object { $_.Name }) })
-          if ($extra.Count) { Write-Host "::error::unexpected files arrived: $($extra -join ', ')"; exit 2 }
-          if ($missing.Count) { Write-Host "::error::files missing from the artifact: $($missing -join ', ')"; exit 2 }
-          if ($have.Count -ne 9) { Write-Host "::error::expected nine files, got $($have.Count)"; exit 2 }
-          # the manifest inside the package lists seven of the nine: the catalog and the manifest itself
-          # cannot attest to their own bytes, so those two are covered by the catalog signature instead
-          $sums = Get-Content (Join-Path $env:PACKAGE_DIR 'SHA256SUMS.txt')
-          $checked = 0
-          foreach ($line in $sums) {
-            if ($line -notmatch '^([0-9A-Fa-f]{64})\s+(\S+)$') { Write-Host "::error::unparsable manifest line: $line"; exit 2 }
-            $want = $Matches[1].ToUpperInvariant(); $name = $Matches[2]
-            $path = Join-Path $env:PACKAGE_DIR $name
-            if (-not (Test-Path $path)) { Write-Host "::error::manifest lists $name but it is absent"; exit 2 }
-            $got = (Get-FileHash $path -Algorithm SHA256).Hash.ToUpperInvariant()
-            if ($got -ne $want) { Write-Host "::error::$name digest mismatch after transport: manifest $want, file $got"; exit 2 }
-            $checked++
+          # Two distinct claims, kept apart on purpose, and both judged by install/candidate_asset_assert.ps1
+          # - the same script the local candidate simulation drives:
+          #   the HOST is judged as a release asset - exactly one file, byte-identical to the digest a
+          #     different job recorded from the server's own asset record, carrying a signature from the
+          #     pinned identity with its timestamp recorded as observed (an untrusted self-signed chain is a
+          #     trust statement, not a tamper signal, and is never presented as a timestamp failure);
+          #   the PAYLOAD is judged by the inner chain - expanded with a tool built from this checkout, never
+          #     with one taken from inside the candidate, then tied member by member back to this host.
+          $metaFile = Join-Path $env:RUNNER_TEMP 'meta-in\asset-sha256.txt'
+          if (-not (Test-Path $metaFile)) { $metaFile = Join-Path $env:GITHUB_WORKSPACE 'meta\asset-sha256.txt' }
+          $recorded = if (Test-Path $metaFile) { (Get-Content $metaFile -Raw).Trim() } else { '' }
+          if (-not $env:BUNDLE_TOOL) {
+            Write-Host '::error::no bundle tool was built; a bundled candidate cannot be opened'
+            exit 4
           }
-          if ($checked -ne 7) { Write-Host "::error::the manifest covers $checked files, expected 7"; exit 2 }
-          Write-Host "  assets : nine files delivered, $checked digests re-verified against the package manifest"
+          .\install\candidate_asset_assert.ps1 -PackageDir $env:PACKAGE_DIR -RecordedSha $recorded -BundleTool $env:BUNDLE_TOOL -PayloadDir $env:PAYLOAD_DIR
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::error::the delivered asset or its payload did not hold up (code $LASTEXITCODE)"
+            exit $LASTEXITCODE
+          }
 
       # before anything from the package can run, and re-used later as the drift reference
       - name: capture the pre-execution baseline
@@ -304,7 +303,7 @@ jobs:
         shell: pwsh
         run: |
           if (-not $env:CATSIG) { Write-Host '::error::no verifier binary was built'; exit 1 }
-          .\install\ci_preverify_selftest.ps1 -PackageDir $env:PACKAGE_DIR -Catsig $env:CATSIG
+          .\install\ci_preverify_selftest.ps1 -PackageDir $env:PAYLOAD_DIR -Catsig $env:CATSIG -Bundled -Installer (Join-Path $env:PACKAGE_DIR 'cm400-setup.exe') -BundleTool $env:BUNDLE_TOOL
 
       # the attack regression, against the same candidate: flipped signed content, flipped embedded
       # certificate, rebuilt member list, swapped pairs and layout smuggling - each asserted with the
@@ -316,14 +315,14 @@ jobs:
         shell: pwsh
         run: |
           if (-not $env:CATSIG) { Write-Host '::error::no verifier binary was built'; exit 1 }
-          .\install\ci_catalog_attack_regression.ps1 -Package $env:PACKAGE_DIR -Catsig $env:CATSIG
+          .\install\ci_catalog_attack_regression.ps1 -Package $env:PAYLOAD_DIR -Catsig $env:CATSIG -Bundled -Installer (Join-Path $env:PACKAGE_DIR 'cm400-setup.exe') -BundleTool $env:BUNDLE_TOOL
 
       - name: verify the candidate before anything acts on it
         env:
           GITHUB_TOKEN: ''
           GH_TOKEN: ''
         shell: pwsh
-        run: .\install\ci_preverify_candidate.ps1 -PackageDir $env:PACKAGE_DIR -Catsig $env:CATSIG
+        run: .\install\ci_preverify_candidate.ps1 -PackageDir $env:PAYLOAD_DIR -Catsig $env:CATSIG -Bundled -Installer (Join-Path $env:PACKAGE_DIR 'cm400-setup.exe') -BundleTool $env:BUNDLE_TOOL
 
       # cross-check only, and deliberately after the gate above: this one asks the candidate's own
       # installer to report on its package, so it is a second opinion from inside the package, not
@@ -333,7 +332,7 @@ jobs:
           GITHUB_TOKEN: ''
           GH_TOKEN: ''
         shell: pwsh
-        run: .\install\ci_candidate_verify.ps1 -PackageDir $env:PACKAGE_DIR
+        run: .\install\ci_candidate_verify.ps1 -PackageDir $env:PAYLOAD_DIR -Catsig $env:CATSIG -Bundled -Installer (Join-Path $env:PACKAGE_DIR 'cm400-setup.exe') -BundleTool $env:BUNDLE_TOOL
 
       - name: the verification stage left the machine as it found it
         env:
@@ -353,7 +352,7 @@ jobs:
           GITHUB_TOKEN: ''
           GH_TOKEN: ''
         shell: pwsh
-        run: .\install\ci_device_free_install.ps1 -PackageDir $env:PACKAGE_DIR -LogDir $env:LOG_DIR
+        run: .\install\ci_device_free_install.ps1 -PackageDir $env:PAYLOAD_DIR -LogDir $env:LOG_DIR -Bundled -Installer (Join-Path $env:PACKAGE_DIR 'cm400-setup.exe')
 
       - name: final read-only state snapshot
         if: always()

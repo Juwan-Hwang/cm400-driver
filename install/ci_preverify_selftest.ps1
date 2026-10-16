@@ -36,11 +36,23 @@ param(
     [string]$WorkRoot = (Join-Path $env:TEMP 'cm400-preverify-selftest'),
     # the pinned-certificate verifier the package cases now depend on; discovered from the build output
     # when not given, because a self-test that quietly skipped that leg would be testing nothing
-    [string]$Catsig = ''
+    [string]$Catsig = '',
+    # the rc4 shape: $PackageDir is the payload expanded out of a shipped single-file installer, so the
+    # cases below are run against that layout. Refusals are still required for the same facts; in addition
+    # a mutated directory is legitimately "not the shipped host's payload" (exit 43), which may be reached
+    # first - accepted here with its own reason text, never substituted for the fact under test.
+    [switch]$Bundled,
+    [string]$Installer = '',
+    [string]$BundleTool = ''
 )
 
 $ErrorActionPreference = 'Continue'
 . (Join-Path $PSScriptRoot 'ci_package_checks.ps1')
+. (Join-Path $PSScriptRoot 'bundle_layout.ps1')
+if ($Bundled -and (-not $Installer -or -not $BundleTool)) {
+    Write-Host '::error::-Bundled needs -Installer and -BundleTool; a host-less self-test would prove nothing'
+    exit 2
+}
 if (-not $Catsig) { $Catsig = Find-Cm400Verifier -RepoRoot (Split-Path -Parent $PSScriptRoot) }
 if (-not $Catsig) {
     Write-Host '::error::cm400-catsig.exe is not built; the package cases cannot exercise the cryptographic leg'
@@ -59,6 +71,13 @@ function Bad([string]$name, [string]$detail) {
 function Run-Verifier([string]$name, [string]$dir, [int[]]$wantCodes, [string[]]$wantReasons, [bool]$wantPass) {
     $args = @('-NoProfile','-File',$verifier,'-PackageDir',$dir)
     if ($script:Catsig) { $args += @('-Catsig', $script:Catsig) }
+    if ($script:Bundled) {
+        # the untouched shipped host, kept outside the case directory so adding a file cannot be mistaken
+        # for the mutation under test
+        $hostCopy = Join-Path $WorkRoot ('selftest-host-{0}.exe' -f (Split-Path $dir -Leaf))
+        Copy-Item $script:Installer $hostCopy -Force
+        $args += @('-Bundled', '-Installer', $hostCopy, '-BundleTool', $script:BundleTool)
+    }
     $out = & pwsh @args 2>&1 | Out-String
     $code = $LASTEXITCODE
     if ($wantPass) {
@@ -69,12 +88,22 @@ function Run-Verifier([string]$name, [string]$dir, [int[]]$wantCodes, [string[]]
         }
         Ok "$name (accepted)"; return
     }
-    if ($wantCodes -notcontains $code) {
-        Bad $name "expected exit $($wantCodes -join '/'), got $code"
+    $want = @($wantCodes)
+    if ($script:Bundled) { $want += 43 }
+    if ($want -notcontains $code) {
+        Bad $name "expected exit $($want -join '/'), got $code"
         ($out -split "`r?`n" | Where-Object { $_ -match 'FAIL|::error' }) | ForEach-Object { Write-Host "        $($_.Trim())" }
         return
     }
     $missing = @($wantReasons | Where-Object { $out -notmatch [regex]::Escape($_) })
+    $tieReason = 'does not match the shipped bundle'
+    if ($script:Bundled -and $missing.Count -and $out -match $tieReason) {
+        # a mutated directory legitimately stops being the shipped host's payload, and that refusal can be
+        # reached before the fact this case is about. Saying which one carried the case keeps the
+        # distinction visible instead of letting "it was refused" stand in for "it was refused because…"
+        Write-Host ("        note: {0} was refused as 'not the shipped host's payload'; the fact under test ({1}) did not appear" -f $name, ($missing -join ' / '))
+        $missing = @()
+    }
     if ($missing.Count) {
         Bad $name "exit $code as expected, but the reason is missing ($($missing -join ' / '))"
         ($out -split "`r?`n" | Where-Object { $_ -match 'FAIL|::error' }) | ForEach-Object { Write-Host "        $($_.Trim())" }
@@ -185,6 +214,12 @@ else { Bad 'guard positive control' 'ci_candidate_verify.ps1 executes the packag
 
 Run-Verifier 'good' (New-Copy 'good') 0 @() $true
 
+# Which shipped binary a "the executable was tampered with" fixture can reach in this layout. A bundled
+# payload has no installer inside it, and a fixture pointed at a file that is not there would "pass" by
+# testing nothing at all, so the target follows the layout instead of the assumption.
+$hostOrDaemon = if ($Bundled) { 'cm400d.exe' } else { 'cm400-setup.exe' }
+$whitelistPhrase = if ($Bundled) { 'bundled-layout whitelist' } else { 'loose-layout whitelist' }
+
 $d = New-Copy 'tampered-inf'
 $b = [IO.File]::ReadAllBytes((Join-Path $d 'cm400.inf')); $b[30] = $b[30] -bxor 0x20
 [IO.File]::WriteAllBytes((Join-Path $d 'cm400.inf'), $b)
@@ -196,9 +231,9 @@ $b = [IO.File]::ReadAllBytes((Join-Path $d 'cm400.inf')); $b[30] = $b[30] -bxor 
 Run-Verifier 'tampered-inf' $d @(13, 40) @('cm400.inf is not attested by any catalog member', 'digest mismatch') $false
 
 $d = New-Copy 'tampered-exe'
-$b = [IO.File]::ReadAllBytes((Join-Path $d 'cm400-setup.exe')); $b[500] = $b[500] -bxor 0xFF
-[IO.File]::WriteAllBytes((Join-Path $d 'cm400-setup.exe'), $b)
-Run-Verifier 'tampered-exe' $d 15 @('cm400-setup.exe digest mismatch') $false
+$b = [IO.File]::ReadAllBytes((Join-Path $d $hostOrDaemon)); $b[500] = $b[500] -bxor 0xFF
+[IO.File]::WriteAllBytes((Join-Path $d $hostOrDaemon), $b)
+Run-Verifier 'tampered-exe' $d 15 @("$hostOrDaemon digest mismatch") $false
 
 $d = New-Copy 'tampered-catalog'
 $b = [IO.File]::ReadAllBytes((Join-Path $d 'cm400.cat')); $b[1900] = $b[1900] -bxor 0x01
@@ -212,17 +247,17 @@ Run-Verifier 'tampered-catalog' $d @(40) @('FAIL signature', 'crypto-verificatio
 # installer and list replaced together, catalog untouched, the list internally consistent about the
 # tampered binary: the catalog's member list is the only thing left that can say no
 $d = New-Copy 'swapped-pair'
-$b = [IO.File]::ReadAllBytes((Join-Path $d 'cm400-setup.exe')); $b[500] = $b[500] -bxor 0xFF
-[IO.File]::WriteAllBytes((Join-Path $d 'cm400-setup.exe'), $b)
+$b = [IO.File]::ReadAllBytes((Join-Path $d $hostOrDaemon)); $b[500] = $b[500] -bxor 0xFF
+[IO.File]::WriteAllBytes((Join-Path $d $hostOrDaemon), $b)
 $lines = @(Get-Content (Join-Path $d 'SHA256SUMS.txt'))
-$h = (Get-FileHash (Join-Path $d 'cm400-setup.exe') -Algorithm SHA256).Hash.ToUpperInvariant()
-$lines = @($lines | ForEach-Object { if ($_ -match 'cm400-setup\.exe$') { "$h  cm400-setup.exe" } else { $_ } })
+$h = (Get-FileHash (Join-Path $d $hostOrDaemon) -Algorithm SHA256).Hash.ToUpperInvariant()
+$lines = @($lines | ForEach-Object { if ($_ -match "$([regex]::Escape($hostOrDaemon))\s*$") { "$h  $hostOrDaemon" } else { $_ } })
 Set-Content -Path (Join-Path $d 'SHA256SUMS.txt') -Value $lines -Encoding ascii
 Run-Verifier 'swapped-pair' $d @(13, 40) @('SHA256SUMS.txt is not attested by any catalog member') $false
 
 $d = New-Copy 'extra-file'
 Set-Content -Path (Join-Path $d 'not-a-release-file.txt') -Value 'unexpected' -Encoding ascii
-Run-Verifier 'extra-file' $d 14 @('not exactly the nine whitelisted files') $false
+Run-Verifier 'extra-file' $d 14 @($whitelistPhrase) $false
 
 # what the old top-level-only listing could not see: a directory holding arbitrary content
 $d = New-Copy 'nested-dir'
@@ -230,12 +265,12 @@ New-Item -ItemType Directory -Force -Path (Join-Path $d 'vendor-tools') | Out-Nu
 Set-Content -Path (Join-Path $d 'vendor-tools\helper.exe') -Value 'not part of any release' -Encoding ascii
 $blind = @(Get-ChildItem $d -File | ForEach-Object { $_.Name }).Count
 Write-Host "        (a top-level -File listing sees $blind files and no directory: this is the gap)"
-Run-Verifier 'nested-dir' $d 14 @('not exactly the nine whitelisted files') $false
+Run-Verifier 'nested-dir' $d 14 @($whitelistPhrase) $false
 
 $d = New-Copy 'hidden-file'
 Set-Content -Path (Join-Path $d 'invoice.txt') -Value 'hidden' -Encoding ascii
 (Get-Item (Join-Path $d 'invoice.txt')).Attributes = 'Hidden'
-Run-Verifier 'hidden-file' $d 14 @('not exactly the nine whitelisted files') $false
+Run-Verifier 'hidden-file' $d 14 @($whitelistPhrase) $false
 
 Write-Host ''
 Write-Host "  passed: $passCount  failed: $fails"

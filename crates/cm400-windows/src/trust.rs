@@ -791,7 +791,7 @@ mod tests {
             format!("{dir}/cm400.cer"),
         );
         if std::fs::metadata(&cat).is_err() {
-            eprintln!("skipped: no throwaway-signed artifact at {cat} (run the local make_identity_decoy tooling)");
+            eprintln!("skipped: no throwaway-signed artifact at {cat} (run install/make_identity_decoy.ps1)");
             return;
         }
         let signer =
@@ -827,7 +827,7 @@ mod tests {
     /// T-A as specified: the pinned release certificate is **inside the same PKCS#7** as a bystander,
     /// while the verified signer is a different, same-subject certificate. An implementation that
     /// resolved identity by scanning the message's collection would pass here; the one under test
-    /// refuses. Produced by the local make_identity_decoy tooling via
+    /// refuses. Produced by `install/make_identity_decoy.ps1` via
     /// `cm400-trust-test decoy-message` (`CryptMsgControl(CMSG_CTRL_ADD_CERT)` plus
     /// `CryptMsgGetParam(CMSG_ENCODED_MESSAGE)`), and only asserted against the artifact that actually
     /// exists - a fixture the tests never see is not coverage.
@@ -1251,7 +1251,7 @@ mod tests {
                 .expect("the pinned catalog must parse");
             assert!(inside.iter().any(|c| c.sha256_der == PINNED_SHA256_DER));
         } else {
-            eprintln!("skipped: no pinned-identity catalog at {pinned} (run the local sign_fixed_identity tooling)");
+            eprintln!("skipped: no pinned-identity catalog at {pinned} (run install/sign_fixed_identity.ps1)");
         }
 
         // A file that is not a signed catalog yields no verified signer, and "no signer" is a refusal

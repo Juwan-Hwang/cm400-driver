@@ -25,7 +25,7 @@
 //! - **Cross-source ordering is semantic, not timestamp arithmetic**: SAM report times and
 //!   ETW arrival times are different clock domains and are never compared with each other.
 //!
-//! Not yet settled (see the maintainer-side release notes (SENSOR-ACTIVITY-INTEGRATION) §4.2/§7): the suppression
+//! Not yet settled (see docs/SENSOR-ACTIVITY-INTEGRATION.md §4.2/§7): the suppression
 //! window needs a measured stop-tail bound. Until that exists it is
 //! [`Suppression::Disabled`], and `R2` therefore cannot outrun the heartbeat tail.
 

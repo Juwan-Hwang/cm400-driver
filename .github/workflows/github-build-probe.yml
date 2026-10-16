@@ -1,0 +1,107 @@
+# Development probe: can this repository produce a verifiable build provenance at all?
+#
+# This workflow exists to answer one question with a measured result rather than a guess: whether GitHub
+# Artifact Attestations are available for THIS repository as it currently stands (a private repository on a
+# personal account). GitHub's documentation says the private-repository attestation storage requires
+# GitHub Enterprise Cloud, so the plausible answer here is "no" - and an answer copied from documentation
+# would still leave the actual plan unverified.
+#
+# What this probe is, and is not:
+#   it IS a test of the storage and of the round trip: build here, attest what was built here, then verify
+#     the statement from the same job, so the answer covers write and read;
+#   it is NOT the release pipeline. The subject is an unsigned binary from a development build. A release
+#     attestation must bind the digest of the SIGNED file that is actually published, and the signing step
+#     is a separate unresolved question: the fixed self-signed identity cannot be used on a GitHub-hosted
+#     runner without placing its private key on that runner, which this project refuses to do.
+#
+# Dispatch only. It creates no tag, no release, no asset, and holds no write permission for any of them.
+name: github-build-probe
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write        # the OIDC identity the attestation is signed with
+  attestations: write    # the write the probe is measuring
+
+concurrency:
+  group: github-build-probe
+  cancel-in-progress: false
+
+jobs:
+  provenance:
+    runs-on: windows-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # the same pinned toolchain the quality workflow uses, so "attested from this commit" also means
+      # "built by the compiler the project is tested against"
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
+        with:
+          toolchain: 1.97.1
+
+      - name: build the release binaries from this exact commit
+        env:
+          CARGO_TERM_COLOR: never
+        run: |
+          cargo build --workspace --bins --release --locked
+          if ($LASTEXITCODE -ne 0) { Write-Host "::error::the release build failed"; exit 1 }
+          $exe = 'target\release\cm400-setup.exe'
+          if (-not (Test-Path $exe)) { Write-Host '::error::no cm400-setup.exe was built'; exit 1 }
+          "SUBJECT=$(Resolve-Path $exe)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host ("  built   : {0} bytes" -f (Get-Item $exe).Length)
+          Write-Host ("  sha256  : " + (Get-FileHash $exe -Algorithm SHA256).Hash)
+          Write-Host ("  commit  : $env:GITHUB_SHA")
+
+      - name: attest the provenance of what was just built
+        id: attest
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          # the path, not a digest: the action hashes the file it signs a statement about, so the statement
+          # cannot be made about bytes different from the ones on disk here
+          subject-path: target/release/cm400-setup.exe
+
+      - name: verify the statement through the same trust path a user would use
+        shell: pwsh
+        run: |
+          # Verification is the half that matters: a stored statement nobody can retrieve and check is not
+          # provenance an outsider can validate.
+          $exe = $env:SUBJECT
+          $out = & gh attestation verify $exe --owner $env:OWNER --format json 2>&1 | Out-String
+          $code = $LASTEXITCODE
+          Write-Host ("  gh attestation verify exit=$code")
+          ($out -split "`r?`n" | Where-Object { $_.Trim() } | Select-Object -First 20) | ForEach-Object { Write-Host "    | $_" }
+          if ($code -ne 0) {
+            Write-Host '::error::the attestation could not be verified; this account/plan combination does not give us retrievable provenance'
+            exit 1
+          }
+          Write-Host '  the round trip worked on this repository'
+        env:
+          OWNER: ${{ github.repository_owner }}
+          GH_TOKEN: ${{ github.token }}
+
+      - name: report what was measured
+        if: always()
+        shell: pwsh
+        run: |
+          Write-Host "  repo      : $env:GITHUB_REPOSITORY (private, personal account)"
+          Write-Host "  commit    : $env:GITHUB_SHA"
+          Write-Host "  attestation step outcome: $env:ATTEST_OUTCOME"
+          Write-Host '  note: the subject is an UNSIGNED development binary. This measures attestation'
+          Write-Host '        storage and retrievability only; it is not a release statement about a'
+          Write-Host '        published, signed artifact.'
+        env:
+          ATTEST_OUTCOME: ${{ steps.attest.outcome }}
+
+      - name: keep the attestation bundle for a day
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: attestation-probe
+          path: ${{ env.RUNNER_TEMP }}/.attestations
+          if-no-files-found: ignore
+          retention-days: 1

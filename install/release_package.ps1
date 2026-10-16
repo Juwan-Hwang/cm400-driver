@@ -12,7 +12,7 @@
   them is hashed for the user to verify, and that the INF/CAT pair is self-consistent.
 
   What this script does NOT prove: that a clean Windows machine can install the result. Driver
-  signature trust is a separate, unresolved release item; see the maintainer-side release notes (RELEASE-READINESS).
+  signature trust is a separate, unresolved release item; see docs/RELEASE-READINESS.md.
 
   Hash coverage note (deliberate): `SHA256SUMS.txt` covers every file placed in the package, not just
   the installer executable. Verifying only the EXE would leave INF, CAT and the certificate beside it
@@ -53,7 +53,7 @@ if (-not $Out) { $Out = Join-Path $repo 'dist' }
 # error rather than a silent fallback - shipping without one is what `-NoSigning` says out loud.
 if (-not $CatPath) { $CatPath = Join-Path $repo 'dist/fixed-id/cm400.cat' }
 if (-not $NoSigning -and -not (Test-Path $CatPath)) {
-    throw "no catalog at $CatPath; run the local sign_fixed_identity tooling (it writes SHA256SUMS.txt inside the catalog) or pass -CatPath"
+    throw "no catalog at $CatPath; run install/sign_fixed_identity.ps1 (it writes SHA256SUMS.txt inside the catalog) or pass -CatPath"
 }
 if ($NoSigning) {
     Write-Host 'NOTE: -NoSigning builds an unsigned tree for CI checks. It is not a release: nothing here can be installed.'
@@ -69,15 +69,18 @@ Write-Host "target directory: $targetDir"
 
 # Measured on this machine: `CARGO_TARGET_DIR` has pointed at three different trees, so `cargo metadata`
 # can name one holding yesterday's binaries. Skipping the build while shipping whatever that directory
-# happens to contain would package an installer whose checks are not the checks in the source tree, so
-# `-SkipBuild` is only allowed when every binary is at least as new as the newest build input - which
-# includes the root workspace manifest and the committed `Cargo.lock`, not just `crates/`.
+# happens to contain would package an installer whose checks are not the checks in the source tree.
+# Two things are needed and they are not the same thing: the binaries must EXIST in the named tree, and
+# that tree must be current with respect to the source. Comparing file timestamps conflates them and
+# reports false positives - editing one bin's source cannot relink another bin, and cargo is right not to.
 . (Join-Path $PSScriptRoot 'build_inputs.ps1')
 if ($SkipBuild) {
-    Assert-BinariesAreCurrent `
-        -RepoRoot $repo `
-        -Binaries @('cm400-setup.exe', 'cm400d.exe', 'cm400ctl.exe' | ForEach-Object { Join-Path $bin $_ }) `
-        -OwnerHint 'run the build (drop -SkipBuild), or point CARGO_TARGET_DIR at the tree that was built'
+    foreach ($name in 'cm400-setup.exe', 'cm400d.exe', 'cm400ctl.exe') {
+        if (-not (Test-Path (Join-Path $bin $name))) {
+            throw "$name is not built in $bin; run the build (drop -SkipBuild) or point CARGO_TARGET_DIR at the tree that was built"
+        }
+    }
+    Write-Host ('  ' + (Assert-NothingLeftToCompile -RepoRoot $repo))
 }
 
 # --- the whitelist: name -> required? -----------------------------------------------------------
@@ -94,7 +97,7 @@ $required = [ordered]@{
     'LICENSE'             = 'Apache-2.0'
     'SHA256SUMS.txt'      = 'carried from the signed release folder, so the catalog covers its bytes'
 }
-$forbiddenPatterns = @('cm400-iks-probe*', 'cm400-etwprobe*', 'cm400-capture-probe*', 'cm400-trust-test*', 'cm400-catsig*', '*.pdb', '*.lib', 'recover_libwdi*', 'd4_*', 'w0_*', '*.pfx', '*.password')
+$forbiddenPatterns = @('cm400-iks-probe*', 'cm400-etwprobe*', 'cm400-capture-probe*', 'cm400-trust-test*', 'cm400-catsig*', 'cm400-bundle*', '*.pdb', '*.lib', 'recover_libwdi*', 'd4_*', 'w0_*', '*.pfx', '*.password')
 if ($NoSigning) {
     foreach ($k in 'cm400.cat', 'cm400.cer') { $required.Remove($k) }
     Write-Host 'NOTE: -NoSigning (CI mode). The output is not a distributable package: no catalog, no certificate.'
@@ -160,7 +163,7 @@ if ($NoSigning) {
     $placed += 'SHA256SUMS.txt'
     $srcSums = Join-Path $staging 'SHA256SUMS.txt'
 } elseif (-not (Test-Path $srcSums)) {
-    throw "no SHA256SUMS.txt beside $CatPath; sign with the local sign_fixed_identity tooling, which writes the manifest before building the catalog"
+    throw "no SHA256SUMS.txt beside $CatPath; sign with install/sign_fixed_identity.ps1, which writes the manifest before building the catalog"
 } else {
     Copy-Item $srcSums (Join-Path $staging 'SHA256SUMS.txt') -Force
     $placed += 'SHA256SUMS.txt'

@@ -1,7 +1,7 @@
 //! Independent verification of a signed catalog, for use before any candidate binary is executed.
 //!
 //! Three legs, each covering a region the others provably do not (all three measured; see
-//! the maintainer-side release notes (RELEASE-READINESS) §10g/§10h):
+//! `docs/RELEASE-READINESS.md` §10g/§10h):
 //!
 //! 1. **signature** - the catalog's PKCS#7 signature is verified *with the pinned certificate*, so the
 //!    verdict does not depend on whether this machine happens to trust the publisher. A flipped byte

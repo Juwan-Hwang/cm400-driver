@@ -44,6 +44,13 @@ path = "src/bin/cm400_trust_test.rs"
 name = "cm400-catsig"
 path = "src/bin/cm400_catsig.rs"
 
+# Packing and inspecting the single-file installer bundle (see docs/RC4-SINGLE-BUNDLE-INSTALLER.md).
+# Build-time tooling only: it is not shipped, and `install/release_package.ps1` refuses a package that
+# contains it, on the same grounds as `cm400-catsig`.
+[[bin]]
+name = "cm400-bundle"
+path = "src/bin/cm400_bundle.rs"
+
 [[bin]]
 name = "cm400d"
 path = "src/bin/cm400d.rs"
@@ -65,6 +72,8 @@ features = [
     "implement",
     "Win32_Foundation",
     "Win32_Security",
+    # reading a directory's owner before deleting it during the staging sweep
+    "Win32_Security_Authorization",
     # Certificate store access for `cert_cleanup` (removing this release's own self-signed
     # certificate at uninstall time by exact fingerprint + subject + self-signed match).
     "Win32_Security_Cryptography",
@@ -81,6 +90,10 @@ features = [
     "Win32_System_Threading",
     "Win32_System_Time",
     "Win32_System_Console",
+    # ShellExecuteW, used only by the interactive wizard to ask for one elevation
+    "Win32_UI_Shell",
+    # SHOW_WINDOW_CMD, the show flag ShellExecuteW takes
+    "Win32_UI_WindowsAndMessaging",
     "Win32_System_Registry",
     "Win32_Security_WinTrust",
     "Win32_Security_Cryptography_Catalog",

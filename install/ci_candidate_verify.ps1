@@ -16,10 +16,22 @@
 #>
 param(
     [Parameter(Mandatory = $true)][string]$PackageDir,
-    [string]$RepoRoot = (Split-Path -Parent $PSScriptRoot)
+    [string]$RepoRoot = (Split-Path -Parent $PSScriptRoot),
+    # the rc4 shape: the package is the payload of $Installer, and $Installer is what gets run. Passing
+    # -Bundled without -Installer fails in stage 1 rather than quietly falling back to a package copy of
+    # an installer that is not the shipped file.
+    [switch]$Bundled,
+    [string]$Installer = '',
+    [string]$BundleTool = '',
+    # where cm400-catsig.exe lives. Without it the pre-execution gate has to guess from the build
+    # environment, and a caller whose CARGO_TARGET_DIR differs from this script's view gets exit 42 - a
+    # missing verifier reported as a candidate problem. Passing it changes no verdict: an absent or
+    # unusable verifier still fails the gate, it just fails for the reason it should name.
+    [string]$Catsig = ''
 )
 
 $ErrorActionPreference = 'Continue'
+. (Join-Path $PSScriptRoot 'bundle_layout.ps1')
 
 # Order is the substance of this step. The catalog signature, membership and digest checks are decided
 # without running anything from the package; the package's own verifier is consulted afterwards and is
@@ -32,7 +44,11 @@ if (-not (Test-Path $pre)) {
     exit 16
 }
 Write-Host '--- stage 1: pre-execution verification (no candidate code) ---'
-& $pre -PackageDir $PackageDir -RepoRoot $RepoRoot
+if ($Bundled -and (-not $Installer -or -not $BundleTool)) {
+    Write-Host '::error::-Bundled needs -Installer and -BundleTool; refusing to verify a payload it cannot tie to a shipped host'
+    exit 17
+}
+& $pre -PackageDir $PackageDir -RepoRoot $RepoRoot -Bundled:$Bundled -Installer $Installer -BundleTool $BundleTool -Catsig $Catsig
 $preCode = $LASTEXITCODE
 if ($preCode -ne 0) {
     Write-Host "::error::pre-execution verification failed ($preCode); the candidate is not accepted and nothing from it was executed"
@@ -49,10 +65,15 @@ $PackageDir = (Resolve-Path $PackageDir).Path
 Write-Host "=== candidate verification ==="
 Write-Host "  package : $PackageDir"
 
-$required = @('cm400-setup.exe', 'cm400d.exe', 'cm400ctl.exe', 'cm400.inf', 'cm400.cat',
-    'cm400.cer', 'cm400.cat.thumbprint.txt', 'SHA256SUMS.txt', 'LICENSE')
+$layout = Get-ReleaseLayoutExpectations -Bundled:$Bundled
+$required = $layout.Files
 foreach ($r in $required) {
     if (-not (Test-Path (Join-Path $PackageDir $r))) { Bad 11 "required file missing: $r" }
+}
+if ($layout.HostInPackage -and -not $Bundled) {
+    Write-Host '  layout : loose (the installer ships beside its package files)'
+} else {
+    Write-Host "  layout : bundled - the host is the shipped installer, not a package file: $Installer"
 }
 
 # no private material and no experiment tooling may ride along in a public package
@@ -128,8 +149,17 @@ if ($ekuOids -contains '1.3.6.1.5.5.7.3.3') {
 Write-Host "  not after    : $($cer.NotAfter.ToString('s'))"
 
 Write-Host '--- stage 2: the shipped verifier, as corroboration of the independent result ---'
-$setup = Join-Path $PackageDir 'cm400-setup.exe'
-$out = & $setup verify-package (Join-Path $PackageDir 'cm400.inf') 2>&1 | Out-String
+# in the bundled layout the installer IS the shipped host and the directory is its payload, so the run has
+# to be told which layout it is judging rather than left to apply the loose rule to a staged package
+$setup = if ($Bundled) { $Installer } else { Join-Path $PackageDir 'cm400-setup.exe' }
+if (-not (Test-Path $setup)) {
+    Bad 11 "no installer to consult at $setup"
+    Write-Host "::error::the installer to consult is missing; failing with the accumulated code"
+    exit [Math]::Max($fail, 11)
+}
+$vpArgs = @('verify-package', (Join-Path $PackageDir 'cm400.inf'))
+if ($Bundled) { $vpArgs += '--staged' }
+$out = & $setup @vpArgs 2>&1 | Out-String
 $code = $LASTEXITCODE
 ($out -split "`r?`n" | Where-Object { $_.Trim() }) | ForEach-Object { Write-Host "  vp| $($_.TrimEnd())" }
 Write-Host "  verify-package exit=$code"

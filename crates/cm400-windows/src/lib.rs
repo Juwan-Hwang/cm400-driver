@@ -11,9 +11,11 @@
 //! WinUsb_Initialize fails with ERROR_INVALID_HANDLE (6).
 
 pub mod artifact_manifest;
+pub mod bundle;
 pub mod catalog_trust;
 pub mod cert_cleanup;
 pub mod config;
+pub mod diagnostics;
 pub mod directshow;
 pub mod etw_loss;
 pub mod etw_source;

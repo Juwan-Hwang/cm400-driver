@@ -1,6 +1,6 @@
 //! Kernel-Process lifecycle collector that runs **in the service's own account**.
 //!
-//! Why this exists. The prototype capture in the maintainer-side release notes (SENSOR-ACTIVITY-INTEGRATION) B.9 was made
+//! Why this exists. The prototype capture in `docs/SENSOR-ACTIVITY-INTEGRATION.md` B.9 was made
 //! from an elevated shell, which proves nothing about whether `LocalService` - the account the
 //! product actually runs in - can create and consume its own session. This module answers that,
 //! and it also answers the second question an administrator shell cannot: whether event loss can
@@ -1089,6 +1089,9 @@ mod tests {
     #[test]
     #[ignore = "needs the captured ETL; run with --ignored --nocapture"]
     fn decodes_the_captured_etl_and_matches_the_os_decode() {
+        // the directory comes from the environment, and the fallback goes through the OS temp path: a
+        // hard-coded `C:\Users\<name>\...` would pin this test to one person's machine and put a local
+        // account name into a published source file for no benefit
         let dir = std::env::var("CM400_KPROCDIAG_DIR").unwrap_or_else(|_| {
             std::env::temp_dir()
                 .join("cm400-kernel-process-diag")

@@ -2,7 +2,7 @@
 <#
   Which files count as build inputs, and how fresh the shipped binaries have to be.
 
-  Why a shared module: both the local sign_fixed_identity tooling and `install/release_package.ps1` need to
+  Why a shared module: both `install/sign_fixed_identity.ps1` and `install/release_package.ps1` need to
   refuse a binary older than the sources it is supposed to contain. The first version of that check only
   walked `crates/`, which missed the workspace manifest and the lock file at the repository root - the
   two inputs that decide which dependency versions get compiled in, and this repository commits
@@ -78,6 +78,32 @@ function Get-BuildInputFiles {
 function Get-NewestBuildInput {
     param([Parameter(Mandatory)][string]$RepoRoot)
     @(Get-BuildInputFiles -RepoRoot $RepoRoot | Sort-Object LastWriteTime -Descending | Select-Object -First 1)[0]
+}
+
+function Assert-NothingLeftToCompile {
+    <#
+    .SYNOPSIS
+        Proves the release tree is current by asking cargo, not by comparing timestamps.
+
+    .DESCRIPTION
+        `Assert-BinariesAreCurrent` compares every shipped binary against the newest tracked source, which
+        is conservative to the point of a false positive: changing one bin's source cannot change another
+        bin that does not depend on it, and cargo correctly leaves the second one alone with its old mtime.
+        A second build that compiles nothing is the statement we actually want - every target is up to date
+        with respect to its own dependency graph - and it still fails loudly when no build has run at all.
+    #>
+    param([string]$RepoRoot = (Split-Path -Parent $PSScriptRoot))
+    $out = & cargo build --workspace --bins --release --manifest-path (Join-Path $RepoRoot 'Cargo.toml') 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) {
+        $tail = (($out -split "`r?`n" | Select-Object -Last 8) -join ' / ')
+        throw "verification build failed (exit $LASTEXITCODE): $tail"
+    }
+    $compiled = @($out -split "`r?`n" | Where-Object { $_ -match '^\s*Compiling ' })
+    if ($compiled.Count) {
+        throw ("the tree was not fully built; a second build still had work to do (`n" +
+               ($compiled -join "`n") + "`n). Run the release build again before packaging.")
+    }
+    return 'all release targets are current'
 }
 
 function Assert-BinariesAreCurrent {

@@ -20,13 +20,23 @@
 #>
 param(
     [Parameter(Mandatory = $true)][string]$PackageDir,
-    [string]$LogDir = $env:TEMP
+    [string]$LogDir = $env:TEMP,
+    # the rc4 shape: run the shipped single-file installer with no INF argument, so what is being judged is
+    # the path a real user gets - stage the bundle, verify it, then attempt the install. Passing the
+    # expanded directory's INF instead would silently test the loose layout and leave the bundled one
+    # unexercised on a device-free machine.
+    [switch]$Bundled,
+    [string]$Installer = ''
 )
 
 $ErrorActionPreference = 'Continue'
 . (Join-Path $PSScriptRoot 'ci_state_snapshot.ps1')
 
-$setup = Join-Path $PackageDir 'cm400-setup.exe'
+if ($Bundled -and -not $Installer) {
+    Write-Host '::error::-Bundled needs -Installer; refusing to fall back to a package copy that is not the shipped host'
+    exit 21
+}
+$setup = if ($Bundled) { $Installer } else { Join-Path $PackageDir 'cm400-setup.exe' }
 $inf = Join-Path $PackageDir 'cm400.inf'
 $installLog = Join-Path $LogDir 'cm400-ci-install-attempt.txt'
 $uninstallLog = Join-Path $LogDir 'cm400-ci-recovery-uninstall.txt'
@@ -42,7 +52,9 @@ if ($before.devices.Count -gt 0) {
 
 Push-Location $PackageDir
 try {
-    $out = & $setup install $inf 2>&1 | Out-String
+    $installArgs = @('install')
+    if (-not $Bundled) { $installArgs += $inf }
+    $out = & $setup @installArgs 2>&1 | Out-String
     $code = $LASTEXITCODE
 }
 finally {

@@ -11,7 +11,7 @@
 
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use cm400_core::{ActivitySource, Clock, Engine, Store};
+use cm400_core::{ActivitySource, Clock, Engine};
 use cm400_persistence::FileStore;
 use cm400_policy::{CM400Activity, Mode, Policy};
 use cm400_state::{PhysicalState, Transition};
@@ -295,25 +295,18 @@ fn report_set(label: &str, n: usize, data: &[u8]) -> bool {
 }
 
 fn status() {
-    let mut store = FileStore::new(store_path());
-    let persisted = store.load();
-
-    // Four different questions. Collapsing them is what made an exclusive-interface
+    // One implementation for both tools. The installer and this CLI each keeping their own idea of
+    // "what is the current state" is how the two came to disagree about the lens before, so the
+    // reporting lives in the library and both binaries print the same lines.
+    //
+    // Four different questions are still four: collapsing them is what made an exclusive-interface
     // failure look like "no camera attached".
-    match cm400_windows::find_motor_interface() {
-        Some((_, via)) => println!("device          : present (MI_02 interface found via {via})"),
-        None => println!("device          : absent (no MI_02 interface under either GUID)"),
+    //
+    // The transport probe stays enabled here because this tool may open the interface; the installer's
+    // `status` runs the same reporter without it.
+    for line in cm400_windows::diagnostics::status_lines(&Config::deployed_daemon_path(), true) {
+        println!("{line}");
     }
-    let mut ch = MotorChannel::new();
-    match ch.get() {
-        Ok(echo) => println!(
-            "motor transport : available (echo={echo} - a state var, NOT physical position)"
-        ),
-        Err(e) => println!(
-            "motor transport : unavailable ({e:?}) - another opener holds MI_02; stop the service to take over"
-        ),
-    }
-    println!("persisted       : {persisted:?}");
 }
 
 fn drive(raise: bool) {

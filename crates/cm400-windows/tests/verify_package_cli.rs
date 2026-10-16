@@ -224,7 +224,7 @@ fn the_pinned_package_is_judged_consistently_whatever_this_machines_trust_state_
 fn exit_39_is_reserved_for_a_valid_signature_that_this_machine_does_not_trust() {
     let cat = repo_file("dist/fixed-id/cm400.cat");
     if !cat.exists() {
-        eprintln!("skipped: no signed release folder (run the local sign_fixed_identity tooling)");
+        eprintln!("skipped: no signed release folder (run install/sign_fixed_identity.ps1)");
         return;
     }
     let dir = stage("trust-only-gap", &cat).expect("staged");
@@ -309,7 +309,7 @@ fn the_signed_release_folder_has_its_manifest_attested() {
     // positive control for the same judgement, using the folder the signing pipeline really produced
     let src = repo_file("dist/fixed-id/SHA256SUMS.txt");
     if !src.exists() {
-        eprintln!("skipped: no signed release folder (run the local sign_fixed_identity tooling)");
+        eprintln!("skipped: no signed release folder (run install/sign_fixed_identity.ps1)");
         return;
     }
     let dir = match stage("attested", &repo_file("dist/fixed-id/cm400.cat")) {

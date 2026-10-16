@@ -21,8 +21,9 @@
      CryptCATOpen/CryptCATEnumerateMember and compared against digests computed locally. Membership is
      what ties the digest list to the signature: replace the list and its hash stops being a member of
      the signed catalog, so it attests to nothing;
-  4. the folder holds exactly the nine whitelisted files and every SHA-256 in that catalog-attested list
-     matches the bytes on disk.
+  4. the folder holds exactly the whitelisted files for the layout under test - the nine-file loose
+     package, or the payload a single-file installer carries - and every SHA-256 in that catalog-attested
+     list matches the bytes on disk.
 
   Why this is sufficient without a purchased certificate: tampering with the catalog breaks (2) or (4);
   re-signing it requires the private key, which is held offline and is in neither the repository, the
@@ -39,7 +40,8 @@
   from that identity or is broken; 13 catalog membership not proven; 14 the file set is not exactly the
   whitelist; 15 digest mismatch; 16 the OS catalog API could not be consulted (reported as a failure,
   never waved through); 40 cryptographic verification against the pinned certificate refused the
-  package; 41 the wrong-key differential did not refuse; 42 the verifier binary was unavailable.
+  package; 41 the wrong-key differential did not refuse; 42 the verifier binary was unavailable;
+  43 the directory being judged is not the payload of the shipped installer it claims to come from.
 
   Which leg decides what, and why it had to be split this way. `Get-AuthenticodeSignature` is now a
   diagnostic line only: measured on this machine, a catalog whose signature is intact but whose publisher
@@ -58,11 +60,18 @@ param(
     [string]$RepoRoot = (Split-Path -Parent $PSScriptRoot),
     # cm400-catsig.exe, built by the acceptance job from this repository. It is not part of the package
     # being verified, which is what keeps the verification outside the candidate's own trust boundary.
-    [string]$Catsig = ''
+    [string]$Catsig = '',
+    # the rc4 shape: $PackageDir is the payload expanded out of $Installer, and the host is not inside it.
+    # Expectations come from Get-ReleaseLayoutExpectations so neither layout inherits the other's list by
+    # accident; passing -Bundled also ties the directory back to that installer's own bundle index.
+    [switch]$Bundled,
+    [string]$Installer = '',
+    [string]$BundleTool = ''
 )
 
 $ErrorActionPreference = 'Continue'
 . (Join-Path $PSScriptRoot 'ci_package_checks.ps1')
+. (Join-Path $PSScriptRoot 'bundle_layout.ps1')
 $script:exitCode = 0
 $script:checks = @()
 
@@ -303,23 +312,37 @@ if (-not $toolOk) {
 }
 
 # ---- 4. exact whitelist, then digests against the catalog-attested list ----------------------
-$expected = @(
-    'LICENSE', 'SHA256SUMS.txt', 'cm400.cat', 'cm400.cat.thumbprint.txt', 'cm400.cer',
-    'cm400-setup.exe', 'cm400.inf', 'cm400ctl.exe', 'cm400d.exe'
-)
+$layout = Get-ReleaseLayoutExpectations -Bundled:$Bundled
+$expected = $layout.Files
 $actual = @(Get-ChildItem $PackageDir -File | ForEach-Object { $_.Name })
 # not `-File` at the top level only: a subdirectory (or a hidden or reparse entry) would make the
-# nine-file check blind to whatever it contains, and "the package is flat" is part of the format
+# whitelist check blind to whatever it contains, and "the package is flat" is part of the format
 $layoutProblems = @(Get-PackageLayoutProblems -Dir $PackageDir -ExpectedFiles $expected)
-Note 'file-set-is-exactly-the-whitelist' ($layoutProblems.Count -eq 0) "top-level files=$($actual.Count) problems=[$($layoutProblems -join ' ; ')]"
-if ($layoutProblems.Count) { Fail 14 'the package directory is not exactly the nine whitelisted files' }
+Note 'file-set-is-exactly-the-whitelist' ($layoutProblems.Count -eq 0) "layout=$($layout.Name) top-level files=$($actual.Count) problems=[$($layoutProblems -join ' ; ')]"
+if ($layoutProblems.Count) { Fail 14 "the package directory is not exactly the $($layout.Name)-layout whitelist" }
+
+if ($Bundled) {
+    # the directory under judgment must be the payload of the file that ships. Without this, the gate could
+    # be pointed at any folder that happens to look right while the released executable carries something
+    # else - the one way a package-shape check can be satisfied by an unrelated tree.
+    if (-not $Installer -or -not $BundleTool) {
+        Fail 43 '-Bundled needs both -Installer and -BundleTool; refusing to judge a package it cannot tie to a host'
+    } else {
+        try {
+            $n = Assert-PackageComesFromInstaller -Installer $Installer -PackageDir $PackageDir -BundleTool $BundleTool
+            Note 'package-is-the-payload-of-the-shipped-host' ($n -ge 1) "index members=$n"
+        } catch {
+            Fail 43 $_.Exception.Message
+        }
+    }
+}
 
 $listed = @{}
 foreach ($line in @(Get-Content (Join-Path $PackageDir 'SHA256SUMS.txt') -EA SilentlyContinue)) {
     if ($line -match '^([0-9a-fA-F]{64})\s+\*?(.+)$') { $listed[$Matches[2].Trim()] = $Matches[1].ToUpperInvariant() }
 }
 # the list attests the shipped material; it cannot attest to itself, and cm400.cat is what signs it
-$mustCover = @($expected | Where-Object { $_ -notin @('SHA256SUMS.txt', 'cm400.cat') })
+$mustCover = $layout.MustCover
 $uncovered = @($mustCover | Where-Object { -not $listed.ContainsKey($_) })
 Note 'digest-list-covers-release-files' ($uncovered.Count -eq 0) "entries=$($listed.Count) uncovered=[$($uncovered -join ',')]"
 if ($uncovered.Count) { Fail 15 "the digest list does not cover: $($uncovered -join ', ')" }

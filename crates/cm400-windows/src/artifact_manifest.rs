@@ -42,6 +42,17 @@ impl Report {
 /// of that catalog (`install_flow` checks `file_catalog_membership`).
 pub const REQUIRED_FILES: [&str; 4] = ["cm400-setup.exe", "cm400d.exe", "cm400.inf", "cm400.cer"];
 
+/// The same rule for the layout that comes out of unpacking a single-file installer's bundle.
+///
+/// The host executable is not inside the package it carries, so its digest cannot be listed here: a file
+/// cannot attest its own bytes, and after `pack + sign + timestamp` the shipped host no longer matches any
+/// digest written before those steps anyway. What speaks for the host is its own Authenticode signature
+/// and the SHA-256 published out of band - a claim the manifest must not be allowed to imply.
+///
+/// A manifest for this layout that *does* name `cm400-setup.exe` is still caught: the file would be listed
+/// and absent, which `verify_dir_with` reports as a problem rather than skipping.
+pub const REQUIRED_STAGED: [&str; 3] = ["cm400d.exe", "cm400.inf", "cm400.cer"];
+
 /// Which required files the manifest does not speak about.
 pub fn uncovered<'a>(entries: &'a [Entry], required: &[&'a str]) -> Vec<&'a str> {
     let listed: Vec<String> = entries
@@ -106,6 +117,14 @@ fn is_safe_relative_name(name: &str) -> bool {
 /// Hash every file the manifest names, in `dir`. Missing files are problems, not skips.
 #[cfg(target_os = "windows")]
 pub fn verify_dir(dir: &Path) -> Result<Report, String> {
+    verify_dir_with(dir, &REQUIRED_FILES)
+}
+
+/// The same pass with the required-coverage set chosen by the caller, because "which files must the
+/// manifest speak about" depends on the layout being verified - a loose package contains the installer
+/// itself, a staged bundle does not.
+#[cfg(target_os = "windows")]
+pub fn verify_dir_with(dir: &Path, required: &[&str]) -> Result<Report, String> {
     let path = dir.join("SHA256SUMS.txt");
     let text = std::fs::read_to_string(&path)
         .map_err(|e| format!("no package manifest at {}: {e}", path.display()))?;
@@ -113,7 +132,7 @@ pub fn verify_dir(dir: &Path) -> Result<Report, String> {
     let mut report = Report::default();
     // A manifest that stays silent about a file the install consumes attests nothing about it, so the
     // gap is reported here rather than being left for a caller to remember to check.
-    for gap in uncovered(&entries, &REQUIRED_FILES) {
+    for gap in uncovered(&entries, required) {
         report.problems.push(format!(
             "{gap} is used by the installer but is not covered by SHA256SUMS.txt"
         ));
@@ -381,6 +400,63 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let err = verify_dir(&dir).expect_err("no SHA256SUMS.txt cannot verify a package");
         assert!(err.contains("manifest"), "{err}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn the_staged_layout_is_held_to_its_own_coverage_set() {
+        // a bundle unpacks to a package with no host inside it, so the loose rule would demand a digest
+        // of a file that is not there; the staged rule must still cover the daemon the service runs
+        let dir =
+            std::env::temp_dir().join(format!("cm400-manifest-staged-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in ["cm400.inf", "cm400.cer", "cm400d.exe"] {
+            std::fs::write(dir.join(name), format!("bytes of {name}")).unwrap();
+        }
+        let lines: Vec<String> = ["cm400.inf", "cm400.cer", "cm400d.exe"]
+            .iter()
+            .map(|n| format!("{}  {n}", sha256_of_file(&dir.join(n)).unwrap()))
+            .collect();
+        std::fs::write(dir.join("SHA256SUMS.txt"), lines.join("\n") + "\n").unwrap();
+
+        let staged = verify_dir_with(&dir, &REQUIRED_STAGED).unwrap();
+        assert!(staged.clean(), "{:?}", staged.problems);
+        assert_eq!(staged.checked, 3);
+
+        // the same manifest under the loose rule is a failure rather than a shrug, because a loose
+        // package really does ship the installer beside its INF
+        let loose = verify_dir_with(&dir, &REQUIRED_FILES).unwrap();
+        assert!(
+            loose
+                .problems
+                .iter()
+                .any(|p| p.contains("cm400-setup.exe") && p.contains("not covered")),
+            "{:?}",
+            loose.problems
+        );
+
+        // and a staged manifest that names the host is caught as a listed-but-absent file, so a bundle
+        // cannot make a claim about the executable that carries it
+        std::fs::write(
+            dir.join("SHA256SUMS.txt"),
+            format!(
+                "{}\n{}  cm400-setup.exe\n",
+                lines.join("\n"),
+                "0".repeat(64)
+            ),
+        )
+        .unwrap();
+        let report = verify_dir_with(&dir, &REQUIRED_STAGED).unwrap();
+        assert!(
+            report
+                .problems
+                .iter()
+                .any(|p| p.contains("cm400-setup.exe") && p.contains("absent")),
+            "{:?}",
+            report.problems
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 }

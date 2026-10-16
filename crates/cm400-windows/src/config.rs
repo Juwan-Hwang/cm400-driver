@@ -74,6 +74,13 @@ impl Config {
         Self::data_dir().join("config.toml")
     }
 
+    /// Where the deployed daemon runs from. Stated once so that a status reporter cannot drift away from
+    /// what the installer actually writes; `cm400_setup` keeps its own constant and a test cross-checks
+    /// the two, because a silent disagreement would show up as "installed but not running" reports.
+    pub fn deployed_daemon_path() -> PathBuf {
+        PathBuf::from(r"C:\Program Files\CM400\bin\cm400d.exe")
+    }
+
     /// Load config, falling back to defaults if the file is absent/unreadable. An unreadable file
     /// is reported as such rather than silently looking like "the operator asked for shadow".
     pub fn load() -> Config {

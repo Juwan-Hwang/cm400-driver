@@ -1,260 +1,142 @@
 # CM400 Driver
 
-System-level, invisible, device-specific driver for the CM400 motorized privacy
-webcam (VID `0603` / PID `8612`). When the camera actually starts streaming, the
-lens mechanically rises out of the chassis; when streaming stops, it retracts.
+CM400 网络摄像头的用户态驱动：镜头物理升降由用户态控制，不需要修改内核，也不依赖厂商附带的内核驱动。
+镜头随使用状态自动伸缩（正在出流则伸出，停止出流则缩回），并在重启后保持正确的物理位置。
 
-It is **not** a control app. There is no window, no tray icon, nothing to launch.
-After installation it runs as a background service and the user never touches it.
+> **仓库语言说明**：本文件（`README.md`）为默认中文版本，`README.en.md` 为对应的英文版本。两份文档描述同一套
+> 命令、同一组文件名与同一套安全边界；若出现不一致，视为缺陷。
 
-- Does **not** capture, decode, inspect, store or relay any video frame.
-- Does **not** implement UVC. Streaming stays entirely on the OS-native class
-  driver (`usbvideo` / `uvcvideo` / Apple UVC).
-- Only the mechanical channel is driven, through a strict command whitelist.
+## 状态
 
-## Status
-
-| Platform | State |
+| 平台 | 状态 |
 |---|---|
-| Windows | Implemented and hardware-verified on one machine: motor, activity detection, automatic policy, persistence, Windows service (auto-start, least privilege), install/uninstall/reinstall lifecycle. Scope limits: single capture client (this device does not deliver frames to a second concurrent client), and no genuinely fresh Windows image tested yet - see the maintainer-side release notes (RELEASE-READINESS) |
-| Linux | Planned (`uvcvideo` XU ioctl + PipeWire/V4L2 activity + systemd) |
-| macOS | Planned (CoreMediaIO activity + DriverKit motor) |
+| Windows | 已实现，并在**一台**真机上完成硬件验证：马达、活动检测、自动策略、状态持久化、Windows 服务（自动启动、最小权限）、安装/卸载/重装完整生命周期。范围限制：单个采集客户端（本设备不会向第二个并发客户端出流）；**尚未在真正全新的 Windows 镜像上验证** —— 见维护者侧发布说明（RELEASE-READINESS） |
+| Linux | 计划中（`uvcvideo` XU ioctl + PipeWire/V4L2 活动检测 + systemd） |
+| macOS | 计划中（CoreMediaIO 活动检测 + DriverKit 马达） |
 
-## How it works
+## 获取与安装（Windows）
 
-- **Activity**: a real-time ETW consumer watches the Microsoft MF-FrameServer
-  provider for the per-stream heartbeat (`EventId=10`) and attributes each event to
-  *this* device by its USB symbolic link. Activity is therefore "CM400 is really
-  streaming", not "some app holds a camera".
-- **Motor**: a user-space WinUSB control transfer to the device's motor function
-  (MI_02). Open loop - there is no position feedback, so the driver models
-  physical state and settles it after the measured maximum travel time.
-- **Policy**: asymmetric by design. Rise is eager (privacy exposure is the worst
-  outcome); retract is conservative (a grace period absorbs stream restarts).
-  Physical state survives restarts and service reinstall/recovery.
-- **Device access is on demand**: the motor interface is opened for one command and
-  released immediately, so the driver never sits on a DFU-class interface and block
-  vendor firmware tools.
+一个发布版本只交付**一个文件**：`cm400-setup.exe`。驱动 INF、已签名 catalog、签名证书的公钥部分、守护进程
+`cm400d.exe` 与 Apache-2.0 许可证全文都嵌在它内部 —— 不需要再下载别的文件，也不需要手工把一组文件摆进某个
+目录。
 
-## Release model and known limitations (Windows)
+运行之前，先把它的 SHA-256 与发布页上公布的那一个值比对：
 
-> **CM400 Driver never requires a paid signing certificate or a Microsoft-signed
-> custom driver.**
+```powershell
+Get-FileHash .\cm400-setup.exe -Algorithm SHA256
+```
 
-- Uses the **Microsoft inbox `WinUSB.sys`**. We do not ship or sign any kernel
-  driver of our own; only the driver *package catalog* is signed.
-- The CM400 firmware exposes **no Microsoft OS descriptor** (no `0xEE` string, and
-  `bcdUSB=2.00` so no BOS / MS OS 2.0). Therefore Windows cannot bind WinUSB
-  automatically, and a custom `.inf` package is technically required - "just plug it
-  in, zero driver package" is not achievable on this hardware.
-- Signing is a **build-time** step. The current flow (the local identity_create tooling once, then
-  the local sign_fixed_identity tooling per release) signs the catalog with **one fixed self-signed
-  publishing identity** whose private key stays in an encrypted PFX outside the repository; the
-  shipped package carries only the public certificate and its fingerprint. Writing to the local trust
-  stores is **no longer a build-time job** - the installer does it, and can prove it worked.
-- Historical note: the local d3_sign_catalog tooling mints a *per-machine* certificate, destroys its key
-  after signing and enrolls that certificate locally. That is what produced the still-present
-  `346DF6063A90FA2A877384066E8CA0D391438F07`, which is deliberately kept (uninstall must not delete a
-  certificate it did not install by record). It is not the release path.
-- What `cm400-setup install` checks, each with its own exit code: elevation (20), INF/CAT/CER present
-  (21), the whole-package digest list and that the list is itself inside the signed catalog (30), the
-  certificate that actually signed the catalog against the pinned identity (29 unresolvable signer,
-  31 identity mismatch), trust establishment and its ownership record (33/35), and the package
-  verification after trust exists (34). `verify-package` additionally distinguishes "signature valid,
-  identity pinned, only this machine does not trust it" as **39** so a build machine can be reasoned
-  about without weakening any gate. Nothing here is decided by parsing human-readable output.
-- No paid code-signing certificate, no EV certificate and no Partner Center / WHQL attestation
-  submission is used. **Windows kernel test-signing mode (`bcdedit /set testsigning on`) is neither
-  required nor used as an installation method** - it was explicitly removed from the process.
-- Consequence for a release: this is still a **custom trust model**, not a distributable signature.
-  The installer now establishes the trust itself, so a target machine no longer has to be pre-
-  trusted - but it must be able to run an elevated installer, and strict enterprise policies
-  (**WDAC**, **Smart App Control**, driver-blocking AppLocker rules) **may refuse** a locally signed
-  driver package regardless. A genuinely clean Windows image has not been tested (one machine, no
-  VM); see the maintainer-side release notes (RELEASE-READINESS).
-- Uninstall removes what CM400 owns: the service registration, our driver package from the Driver
-  Store, the files under `C:\ProgramData\CM400` (state, log and rotated archives), **the deployed
-  service image under `C:\Program Files\CM400`**, the release's own certificate from
-  `LocalMachine\Root` and `LocalMachine\TrustedPublisher`, and finally the ownership record itself.
-  Which stores may be cleaned is decided by that record, per store: `AddedByInstall` is removed, a
-  certificate that was already `Preexisting` is left alone, an absent record falls back to the
-  approved legacy path, and a record that cannot be believed **stops automatic cleanup** (exit 37)
-  instead of being guessed at. A certificate is deleted only when its DER SHA-256 matches the pinned
-  identity, its thumbprint locates exactly one entry, its subject is `CN=CM400 Driver` and it is
-  self-signed, and the store is re-read afterwards to confirm the outcome. The deployed image is
-  removed only when the image the SCM had registered parses to that exact path (never a substring
-  match), the registration is confirmed gone by re-querying, and the tree holds nothing this product
-  did not put there; otherwise it is kept and the reason printed. The ownership record is deleted only
-  after certificate cleanup is confirmed, so an unverified state keeps the record. It never touches
-  another vendor's package or certificate - verified with a third-party root certificate as decoy.
+**这一条摘要就是分发完整性的核对手段，必须由你从发布页独立取得**，而不是由文件自己声称。它与安装器内部的
+校验不是同一件事，也不能彼此替代：
 
-### Release model decision (identity, trust establishment and the lifecycle are verified on this machine; a clean Windows image is not)
+| 检查 | 它证明什么 | 它不证明什么 |
+| --- | --- | --- |
+| 你手工核对的发布页 SHA-256 | 你手上这个可执行文件的字节与发布方公布的字节一致 | 任何关于"谁发布了它"的判断（摘要不是身份），也不替代内部校验 |
+| 外层 Authenticode 签名 | 该可执行文件由固定发布身份签名、签名后未被改动 | 发布者已被 Windows 信任（见下方"自签名"一节）；也不覆盖对内部成员的逐条判定 |
+| 内层 catalog 签名 + 固定身份 + 成员绑定 + 逐条摘要 | 载荷中**每一个**成员（INF、CAT、CER、守护进程、清单）都是被 attest 的那一份，且在信任库、Driver Store、服务注册或部署映像被改动**之前**通过判定 | 安装器自身代码是否被换过 —— 那只能靠外层签名与发布页摘要（两者是不同层次的主张） |
 
-The constraint stands: no certificate is purchased. "Installs on a clean machine" and "no purchased
-certificate" are not in conflict - what has to change is the signing and installation flow. The target
-design is:
+安装器的行为：
 
-- **One fixed self-signed publishing identity**, reused by every version. The private key lives only
-  in a controlled signing environment and never in the repository or a release package. Today's
-  build-time behaviour (mint a new certificate per run, destroy the key immediately after signing)
-  is what this replaces: it makes upgrades, trust maintenance and uninstall cleanup needlessly hard.
-- **The installer establishes the local trust**, after the user has verified the SHA-256 of **every
-  file in the package** - not just the executable, because an INF, CAT or certificate beside it must
-  not be swappable - and approved UAC. It checks the shipped certificate's fingerprint and the
-  package integrity, adds that one certificate to the stores the trust decision needs, verifies the
-  trust actually took effect, and only then installs the INF/CAT and registers the service.
-  That component now exists (`crates/cm400-windows/src/trust.rs`): it refuses to trust a certificate
-  whose fingerprint/subject/self-signed identity does not match the pinned release fingerprint, it
-  treats a store it cannot read as *unknown* rather than empty, it confirms every write by
-  re-enumerating the store, and it rolls back exactly the stores it wrote - never a pre-existing
-  entry. It is exercised by a development-only harness (`cm400-trust-test`), which is rejected by the
-  release whitelist instead of adding a switch to the shipped installer. Both paths were measured on
-  this machine starting from an **untrusted** state (temporary trust was added only to build the
-  package and then removed): the success path wrote trust, confirmed it by re-reading both stores,
-  saw the production verifier change from `signature+trust=false` to `true`, and removed the
-  certificate again with the precise cleanup; the partial-success path (second store made to fail)
-  rolled the first store back and left nothing trusted. **It is now wired into `cm400-setup install`
-  and measured end to end on this machine**: a real install exited 0 (identity gate, both stores
-  written and confirmed, ownership recorded, driver staged and bound, service running from the
-  deployed image), a reboot brought the service back by itself, the lift test moved the lens and
-  returned it, and a real uninstall exited 0 removing only our certificate with the older identity
-  left intact. **A clean Windows machine remains unverified.**
-- Uninstall removes only the certificate this product installed, located by fingerprint, and re-reads
-  the store to confirm it is gone (implemented and verified on this machine).
+- **未安装时双击**：说明它将要做什么，要求确认，再请求提权。Windows 11 上确认需要**键入** `YES`，没有默认
+  动作：直接按回车不会继续。
+- **已安装时双击**：进入维护菜单（状态 / 重新安装 / 卸载）。
+- **命令行**：`cm400-setup.exe install | uninstall | status | verify-package | harden-acl`；`--license` 输出
+  Apache-2.0 完整正文。没有终端时执行 `uninstall` 会以**拒绝**退出（28），不会不问就卸载。
+  `verify-package` 判定单文件内部载荷时需要提权（暂存目录刻意只允许 SYSTEM 与 Administrators 写入）；普通用户
+  的核对方式就是上面那一条发布页摘要。
+- 各步检查都有独立退出码：未提权 20、缺少 INF/CAT/CER 21、整包摘要清单与其在已签名 catalog 中的成员身份 30、
+  实际签名者无法解析 29、与钉住身份不符 31、信任建立及其归属记录 33/35、信任已建立后的包校验 34；
+  `verify-package` 额外把"签名有效、身份正确、只是本机暂时不受信"区分为 **39**，以便在构建机上推理而不放松任何
+  门槛。卸载时若归属记录不可信，自动清理**停止**（37）而不是靠猜测执行。以上判定**不解析人类可读的输出文本**。
 
-Stated plainly, because the label matters: Microsoft documents automatic placement of trusted
-publisher certificates as intended for **organization-internal driver testing and debugging**, not for
-packages distributed outside an organization. This is therefore a **custom trust model** - the user
-verifies the files, then the installer establishes self-signed trust - and not a Microsoft-endorsed
-release signature. Nor is it a claim that warnings disappear: until the certificate is trusted, UAC can
-still show an **unknown publisher**, a downloaded executable can still trigger **SmartScreen**, and
-policy-managed machines may still refuse the package. Hash verification tells a user the files match
-the published ones; it promises nothing about those prompts.
+### 关于"未知发布者"与 SmartScreen
 
-Measured on this machine, with the fixed identity created first and left untrusted on purpose
-(the local identity_create tooling -> the local sign_fixed_identity tooling -> the local trust_experiment tooling
--Experiment A`): before importing the public certificate, the installer's own verifier reports
-`signature+trust: FAIL - WinVerifyTrust failed with 0x800b0109` (untrusted root) while `membership`
-still reports `OK` - the two claims are separate; after importing, both are `OK`; after cleanup the
-certificate is gone from both stores, the older production certificate is still there, and the service
-and device were never touched (`Running`, lens `down` throughout). That is a **local trust-mechanism
-verification**, not a clean-Windows first install: this machine still has the Driver Store entry, the
-device binding and the registry state, and no experiment run here can stand in for a fresh image.
+这是**固定自签名（self-signed）**身份下的自定义信任模型，不是微软签发或背书的发布签名。Windows 仍可能对下载来的可执行文件显示
+**未知发布者**或 **SmartScreen** 提示；本项目**不承诺消除这些提示，安装器也不尝试绕过它们**。安装器实际做的是：
+在核对外层摘要并通过内部校验之后、在你批准 UAC 之后，把这一张发布证书写入本机所需信任库，**复读确认**已生效，
+再安装 INF/CAT 并注册服务；卸载时只删除由它自己写入的证书（按 DER SHA-256 匹配钉住身份、指纹唯一定位、
+subject 为 `CN=CM400 Driver` 且自签名这几条判定），并复读存储以确认结果。企业侧的严格策略（WDAC、
+Smart App Control、阻止驱动的 AppLocker 规则）**仍可能拒绝**本地签名的驱动包。
 
-Status of the three experiments that had to be separated: **A** (a trusted self-signed package is
-accepted) passed on this machine; **B** (the installer establishes the trust itself) is implemented,
-wired into `cm400-setup install` and passed on a real install; **C** (uninstall / reinstall) has been
-run on this machine - a real uninstall exited 0 with certificate cleanup driven by the ownership
-record, and a reinstall afterwards also exited 0. This is still one machine holding its own only
-working install, so none of it substitutes for a fresh image.
+### 如何验证构建来源（当前状态，不粉饰）
 
-The release status stays **developer / beta** for reasons that are concrete, not procedural, and they are
-now split cleanly. What has become a CI fact: `.github/workflows/windows.yml` is green on the release
-branch head, and `.github/workflows/release-candidate.yml` completed its full two-job acceptance on the
-commit `v0.1.0-rc2` points at - one job reads the draft release (a draft is listable only by a
-push-capable identity, which is why the privileged job checks out nothing, builds nothing and executes
-nothing it downloads) and hands the nine assets over, while the acceptance job holds no credential at all,
-rebuilds the catalog verifier from the pinned toolchain, requires its own checkout to be the commit the
-fetch job validated, verifies the catalog against the pinned public key, refuses a foreign key at
-`VERIFY_SIGNATURE_EX`, runs the tamper self-test and the attack regression against the downloaded
-candidate, and reports the machine unchanged afterwards. The local gates those workflows encode are green
-here too: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`,
-`cargo test --workspace --locked`, `cargo check --workspace --all-targets --locked` and
-`git diff --check`. Counts are left to the runs themselves rather than restated here, because a hard-coded
-total is exactly the kind of claim that goes stale.
+目标是：**最终工件由 GitHub Actions 从指定提交构建，且下载者能独立验证这份构建来源**。当前实现状态如下：
 
-What is still **not** proven, and is not written as if it were: no genuinely clean Windows environment has
-been tested - the acceptance runner has no device, so it attests the artefacts and the verification chain,
-not first-install behaviour on hardware - and the candidate daemon bytes have not yet been observed moving
-the lens. Measured on 2026-10-14, the image this development machine actually runs hashes to
-`4808E682B9E47167B2813E088FFFD3DB9AE26F90EA26B4E54D61DB0D9F7DC06E` while the candidate ships
-`BEABA317495C51C0EAC9C4C734316A45E452D1DA85439410C48CC5EBE6FC7FCD`, so the hardware evidence below belongs
-to an earlier build and is not inherited by the candidate bytes until an upgrade installs them and the
-behaviour is observed again.
+- 本仓库是**个人账户下的私有仓库**。按 [GitHub Artifact Attestations 文档](https://docs.github.com/en/actions/concepts/security/artifact-attestations)，
+  私有/内部仓库的 attestation 存储需要 **GitHub Enterprise Cloud**；Free / Pro / Team 计划的私有仓库不具备该能力，
+  公开仓库则适用当前计划。因此**"所有人可独立验证的公开构建证明"目前不具备条件** —— 这一限制不会通过引用只在私有
+  workflow 中可见的记录来绕开。
+- 为了把这个判断变成实测结论，仓库中加入了 `github-build-probe.yml`（仅手动触发、无发布权限、动作引用全部按完整
+  SHA 固定）：它在 runner 上从检出提交构建、为构建产物生成证明、再用用户会用到的同一命令回读验证。**但 GitHub 只注册
+  默认分支上存在的 workflow**，因此该探针在不动 `main` 的前提下无法运行；实测结论仍待该限制被处理后给出。
+- 最终工件**必须由 GitHub 构建**：不允许用本地构建后上传的 EXE 冒充 GitHub 构建产物。签名环节尚待解决：固定自签名
+  身份的私钥不能进入 GitHub runner，也不能放进 GitHub Secrets；能保留该身份的方案需要一个不由 GitHub 持有私钥的
+  远程签名服务（例如以 OIDC 限制到本仓库/受保护环境的外部签名端点）。改用 Azure Artifact Signing 之类服务会使用
+  **它们自己的证书**，等于更换固定签名身份，未经评估不会采纳。
+- 在上述流水线落地之前，可独立核对的事实只有两条：源码与提交（已推送到远端、经 `windows.yml` 门禁），以及发布页
+  公布的单一 SHA-256。
 
-What was open on 2026-10-13 morning is now measured - on that pre-candidate deployed image, which is the
-correct scope for the claim: the fast-retract path was re-verified with a **real
-camera capture on the deployed image that contains the fix** - the stop was attributed on a trusted
-ledger, the grace waiver fired, `SET(2)` followed the SAM stop report **303 ms** later (the heartbeat
-fallback needs 7-8 s), `LedgerUntrusted` appeared zero times, and the lens reached `physical: Down` with a
-confirmation stamped 6.51 s after the command, with exactly two motor commands in the whole round. The two
-uninstall cleanups also fired in a real uninstall: `deployed image : ... removed, absence verified` and
-`ownership record : removed after confirmed cleanup, absence verified`, with the stores differing from
-their pre-uninstall baseline by exactly the pinned certificate. Evidence: the maintainer-side release notes (RELEASE-READINESS) §8d.
-Tooling: the local verify_boot_recovery tooling, the local state_audit tooling and
-the local capture_uninstall_baseline tooling (all read-only; the last one refuses to record a partial
-baseline when unelevated), plus the local trust_transaction_selftest tooling for the temporary-trust
-cleanup paths.
-A rollback that uninstalls the product is never used as a rollback here: that would remove the driver
-package, the service and the persisted state of the machine being protected.
+如何在**不把私钥交给 GitHub** 的前提下让最终工件由 GitHub 构建，其接口与安全设计写在 [`docs/REMOTE-SIGNING.md`](docs/REMOTE-SIGNING.md)：
+它说明签名端点只能做哪两件事、如何用 OIDC 限制到本仓库与指定 ref、如何防重放与任意文件签名、失败时如何 fail-closed，
+以及**目前仍缺少哪些基础设施**。该文档只是设计，未部署、未实测，也不改变固定签名身份。
 
-`Zadig` is **not** a product dependency. It is used only as a recovery/experiment tool during
-development; the shipping installer performs catalog verification, driver package staging and
-binding, service registration, and the local trust enrollment itself (the certificate and its
-signature are produced at build time by the fixed-identity signing script, see above).
+## 工作原理
 
-## Privacy semantics (intentional)
+- **活动检测**：实时 ETW 消费者监听 Microsoft MF-FrameServer 提供程序的逐流出流心跳（`EventId=10`），并按 USB
+  符号链接把事件归属到**这一台**设备。因此"活动"的含义是"CM400 真的在出流"，而不是"某个应用占着摄像头"。
+- **马达**：通过用户态 WinUSB 控制传输访问设备的马达功能，不经过内核驱动。
+- **策略与持久化**：状态机决定伸缩时机，状态与台账落盘；物理位置在重启以及服务重装/恢复后保持。达到台账容量上限时
+  执行回收，但正在出流的进程不会被回收掉其归属，因此不会让"停流"变成不可归属。
 
-The lens follows **actual video flow**. If an application stops streaming frames -
-including the case where the app is still open but backgrounded or video is paused -
-the lens retracts after the grace period. For a physical privacy device we prefer
-"retracted while nothing is being captured" over "exposed because a window is still
-open".
+## 发布模型与已知限制（Windows）
 
-## Building
+- **一枚固定的自签名发布身份**，被每个版本复用。私钥只存在于受控签名环境，绝不进入仓库或发布包。历史上的
+  `346DF6063A90FA2A877384066E8CA0D391438F07` 由旧流程（构建时临时造证书、签完立即销毁私钥）产生，被**有意保留**
+  （卸载不得删除归属记录显示不是自己装的证书），它不是发布路径。当前发布身份指纹为
+  `954E6103349748270B90C8A8A68652A44946ABF1`（subject `CN=CM400 Driver`，自签名）。
+- 不使用付费代码签名证书、不使用 EV 证书，也不提交 Partner Center / WHQL 认证。**内核测试签名模式
+  （`bcdedit /set testsigning on`）既不需要，也不被当作安装手段使用** —— 它已被显式从流程中移除。
+- 卸载会删除属于本产品的东西：服务注册、Driver Store 中我方驱动包、`C:\ProgramData\CM400` 下的文件（状态、日志与
+  轮转归档）、**`C:\Program Files\CM400` 下已部署的服务映像**、该发布证书在 `LocalMachine\Root` 与
+  `LocalMachine\TrustedPublisher` 中的条目，最后是归属记录本身。可清理哪些存储由归属记录**逐存储**决定：
+  `AddedByInstall` 删除，`Preexisting` 保留，记录缺失时回退到已批准的历史路径，记录不可信时停止自动清理（37）。
+  已部署映像只有在"SCM 曾注册的路径可解析为该确切路径"（绝不做子串匹配）、注册已复查确认消失、且目录树中不含本
+  产品未放入之物时才删除；否则保留并打印原因。整个过程不触碰其他厂商的包或证书 —— 这一点用第三方根证书作为诱饵验证过。
+
+## 隐私语义（有意为之）
+
+设备只在被实际使用时保持伸出；没有可信出流活动时镜头缩回，因此不存在"摄像头看起来关着但仍在采集"的状态。活动
+判定基于内核事件流对具体设备的归属，不基于应用窗口或进程名猜测。
+
+## 构建
 
 ```
 cargo build --workspace
 cargo test  --workspace
 ```
 
-Binaries (in `crates/cm400-windows`):
+二进制（位于 `crates/cm400-windows`）：
 
-- `cm400d --console` - foreground host, for development.
-- `cm400d --service` - Windows service host (SCM), the shipped form.
-- `cm400ctl` - diagnostics (`status`, `raise`, `retract`, `activity-watch`, `usbprobe`).
-- `cm400-setup` - product entry point for install / uninstall / ACL repair
-  (`install`, `uninstall`, `harden-acl`, `verify-package`, plus internal staging steps).
-- `cm400-etwprobe`, `cm400-capture-probe`, `cm400-iks-probe` - **development diagnostics, not part
-  of a release package**; the last one exists only because the `IKsControl` path was investigated
-  and is kept as evidence for a possible future study.
+- `cm400d --console` —— 前台运行，用于开发。
+- `cm400d --service` —— Windows 服务宿主（SCM），交付形态。
+- `cm400ctl` —— 诊断（`status`、`raise`、`retract`、`activity-watch`、`usbprobe`）。它只为开发构建；只读的
+  `status` 报告现在位于发布出去的安装器内部（`cm400-setup status`，同一套代码，去掉了需要设备的探针），并且
+  **不是发布资产**。
+- `cm400-setup` —— 产品入口：安装 / 卸载 / 证书清理 / ACL 修复 / 状态 / 包校验 / 许可。
+- `cm400-etwprobe`、`cm400-capture-probe`、`cm400-iks-probe`、`cm400-catsig`、`cm400-bundle` —— 开发期诊断或构建期
+  工具，**不属于发布包**；发布守卫会拒绝它们出现在 bundle 内部。
 
-`cm400-setup install` does the whole job on the target machine: verifies elevation, catalog
-signature and INF membership with native APIs, quiesces the daemon, stages and binds the device
-node, then registers (`sc create`), configures failure recovery, grants the service account its
-directory rights and starts the service. It refuses to report success on an unverified interface.
-What is verified: the full install / uninstall / reinstall lifecycle, and an install with no other
-driver package present, both on real hardware. What is **not** verified: a genuinely fresh Windows
-image with no prior CM400 driver or interface registration.
+发布出去的单个文件由 `install/single_file_package.ps1` 产出（构建二进制 → 写内层清单与 catalog → 按最终布局校验 →
+最后才签名并加 RFC 3161 时间戳 → 重新打开已签名可执行文件再次校验），并由 `install/release_single_file.ps1` 把守：
+发布目录里除 `cm400-setup.exe` 之外不得有第二个文件，bundle 里除发布成员之外不得携带任何别的东西（无签名工具、无探针、
+无符号文件、无安装器自身的第二份副本）。
 
-For the exact claim-by-claim evidence status of every capability, and the release artifact
-whitelist, see **the maintainer-side release notes (RELEASE-READINESS)**.
+已验证的内容：完整的安装 / 卸载 / 重装生命周期，以及在没有任何其他驱动包存在时的真实安装，两者均在真实硬件上。
+**尚未**验证的内容：全新 Windows 镜像（此前没有任何 CM400 驱动或接口注册记录）。台账容量回收路径目前只有单元覆盖，
+真机上未触发过（`reclaimed=0/resets=0`）。
 
-## License
+各能力的逐条证据状态与发布工件白名单，见**维护者侧发布说明（RELEASE-READINESS）**。
 
-Apache-2.0.
+## 许可
 
-## Current status - Windows installation path
-
-> Status update: the Windows device-interface blocker is resolved. `install/cm400.inf` carried a
-> malformed interface GUID string (`8-4-4-4-4-4-4` instead of the registry form `8-4-4-4-12`), which
-> SetupAPI wrote into `Device Parameters` without complaint while WinUSB could not parse it - so no
-> device interface was ever created. With the canonical form, our own GUID now enumerates the motor
-> interface on real hardware and the transport opens. Installing with no libwdi driver package present is now
-> verified on real hardware; what remains unverified is a genuinely fresh Windows image with no prior CM400
-> driver or interface registration.
-
-| Item | Status |
-| --- | --- |
-| D5 installer failure path + recovery | verified on real hardware |
-| D6 uninstall end to end | verified - judged by post-uninstall machine state, not by the exit code: service gone (1060), our package removed, CM400 files removed, while the libwdi package, MI_02's binding, MI_00 (usbvideo) and the motor path all stay untouched |
-| Native trust verification (WinVerifyTrust / CryptCAT) | verified - a valid package, a tampered catalog, a tampered INF and a valid-but-untrusted signer each give a distinct outcome, and the installer needs no SDK tool at runtime |
-| Our own device interface is created automatically | verified - `interface FOUND via production INF`, path `...#{11a9c0d3-5f2b-4e7a-9c31-0b6d2e4f8a10}`, motor transport reachable; pinned by a contract test that compares `install/cm400.inf` against the Rust binary GUID |
-| Automatic raise/retract driven by activity, on our own interface | verified - open CM400 stream: exactly one `SET(1)` carrying `[via production INF ...#{11a9c0d3-...}]`; stop stream: `Active -> Inactive` after 3.0s and exactly one `SET(2)` 10.1s later, still on our interface |
-| Built-in-camera negative test, on our own interface | verified - ~40s of the built-in camera produced zero CM400 heartbeats (`cm400_heartbeats` 189 -> 189) and zero motor commands |
-| Physical raise/retract through our own interface | verified on real hardware - one `SET_CUR` each way through the production interface (no fallback to the Zadig GUID): raise confirmed `physical: Up` after 6.4s, retract confirmed `physical: Down` after 6.4s, with the operator visually confirming both movements |
-| Install / uninstall / reinstall lifecycle, on our own driver | verified by post-action machine state (not exit codes): uninstall removed the service, our package and CM400's files while leaving the libwdi package and MI_00's usbvideo binding untouched; reinstall bound our package, produced the canonical GUID in `Device Parameters`, enumerated our own interface, opened the transport and left the service RUNNING |
-| Install with no libwdi driver package present | verified - both driver packages were removed from the Driver Store, the device re-arrived with no driver at all, and `cm400-setup install` alone bound our INF, produced the canonical GUID in `Device Parameters`, enumerated our own interface, opened the transport and started the service (`INSTALL COMPLETE`, exit 0) |
-| Physical raise/retract after a vacuum install | verified - package identity checked as `original=cm400.inf / provider=CM400 Driver / 0.1.0.10` with zero libwdi packages in the store; one `SET(1)` -> `physical: Up` in 6.41s, operator confirmation, then one `SET(2)` -> `physical: Down` in 6.41s, both carrying the production interface path |
-| Complete standalone install on a clean Windows | not yet verified - needs a fresh OS image (no prior CM400 driver or interface registration); the no-libwdi-package case above is verified on this machine |
-
+Apache-2.0，完整正文见仓库内 `LICENSE`；也可通过 `cm400-setup.exe --license` 直接打印。
