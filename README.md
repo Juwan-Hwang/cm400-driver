@@ -142,6 +142,15 @@ cargo test  --workspace
 
 各能力的逐条证据状态与发布工件白名单，见**维护者侧发布说明（RELEASE-READINESS）**。
 
+## 仓库保护与贡献方式
+
+`main` 受一个名为 `protect-main` 的分支 ruleset 保护（通过 GitHub API 复核过实际参数）：
+
+- 变更必须先开 PR；合并前要求 `windows.yml` 的 `quality-and-packaging` 检查通过，且分支已与 `main` 同步；
+- 必需审查人数为 **0**（单人维护者不会因无法自审而被锁死），但**不配置任何绕过角色**；
+- 禁止强推（non-fast-forward）与删除 `main`；
+- 仓库级策略已开启**要求 Action 以完整 40 位 commit SHA 固定**，因此三个 workflow 里的每个 `uses:` 都是完整 SHA，而不是分支名或版本号。
+
 ## 许可
 
 Apache-2.0，完整正文见仓库内 `LICENSE`；也可通过 `cm400-setup.exe --license` 直接打印。
