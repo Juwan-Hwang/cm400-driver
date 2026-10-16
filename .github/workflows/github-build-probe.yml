@@ -88,13 +88,18 @@ jobs:
         if: always()
         shell: pwsh
         run: |
-          $vis = (& gh api "repos/$env:GITHUB_REPOSITORY" --jq .visibility 2>&1).ToString().Trim()
+          $vis = 'unknown'
+          try { $vis = (& gh api "repos/$env:GITHUB_REPOSITORY" --jq .visibility 2>&1).ToString().Trim() } catch { $vis = 'unreadable' }
           Write-Host "  repo      : $env:GITHUB_REPOSITORY (visibility as reported by the API: $vis)"
           Write-Host "  commit    : $env:GITHUB_SHA"
           Write-Host "  attestation step outcome: $env:ATTEST_OUTCOME"
           Write-Host '  note: the subject is an UNSIGNED development binary. This measures attestation'
           Write-Host '        storage and retrievability only; it is not a release statement about a'
           Write-Host '        published, signed artifact.'
+          # an explicit verdict for the step itself: `pwsh -File` otherwise reports the status of the last
+          # native command it saw, and the visibility lookup above is allowed to fail without making this
+          # reporting step fail
+          exit 0
         env:
           ATTEST_OUTCOME: ${{ steps.attest.outcome }}
 

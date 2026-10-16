@@ -60,15 +60,20 @@ Smart App Control、阻止驱动的 AppLocker 规则）**仍可能拒绝**本地
 
 ### 如何验证构建来源（当前状态，不粉饰）
 
-目标是：**最终工件由 GitHub Actions 从指定提交构建，且下载者能独立验证这份构建来源**。当前实现状态如下：
+目标是：**最终工件由 GitHub Actions 从指定提交构建，且下载者能独立验证这份构建来源**。以下是实测结果，不是文档推查：
 
-- 本仓库是**个人账户下的私有仓库**。按 [GitHub Artifact Attestations 文档](https://docs.github.com/en/actions/concepts/security/artifact-attestations)，
-  私有/内部仓库的 attestation 存储需要 **GitHub Enterprise Cloud**；Free / Pro / Team 计划的私有仓库不具备该能力，
-  公开仓库则适用当前计划。因此**"所有人可独立验证的公开构建证明"目前不具备条件** —— 这一限制不会通过引用只在私有
-  workflow 中可见的记录来绕开。
-- 为了把这个判断变成实测结论，仓库中加入了 `github-build-probe.yml`（仅手动触发、无发布权限、动作引用全部按完整
-  SHA 固定）：它在 runner 上从检出提交构建、为构建产物生成证明、再用用户会用到的同一命令回读验证。**但 GitHub 只注册
-  默认分支上存在的 workflow**，因此该探针在不动 `main` 的前提下无法运行；实测结论仍待该限制被处理后给出。
+- 本仓库现为**公开仓库**。同一份探针工作流（`github-build-probe.yml`，仅手动触发、无发布权限、所有动作引用按完整 SHA 固定）
+  在两种可见性下各跑过一次：私有时的 run `38886755727` 构建成功但**写入证明失败**，错误原文
+  `Feature not available for user-owned private repositories. To enable this feature, please make this repository public.`；
+  公开后的 run `38924226969`（提交 `573484c`）**生成证明成功**，且工作流内 `gh attestation verify` 退出码 0。
+  参 [GitHub Artifact Attestations 文档](https://docs.github.com/en/actions/concepts/security/artifact-attestations)：公开仓库的证明进入公开的
+  Sigstore 实例与不可变透明日志，外部验证者可自行拉取。
+- 独立环境验证也已跑过：从该次运行下载构件（`cm400-setup.exe`，790 016 字节），在**工作流外**的普通环境重算 SHA-256 得
+  `18DE7B44FF80E4572C5D4F85D0063085B81F94681F8FBC44BA0F17E31FAC8B46`，`gh attestation verify --owner Juwan-Hwang` 退出码 0，
+  证明内的 subject digest 与该值一致（声明类型 in-toto Statement v1）。
+- 两个必须一起读的限定：这条证明绑的是**未签名开发构建**，不是发布工件；而 Actions 构件**实测不能匿名下载**
+  （HTTP 403，需登录）——所以面向普通用户的可验证通道必须是 Release 资产本身，不是运行期间的临时构件。
+  正式 RC4 的证明必须绑定**签名后最终 EXE 的真实摘要**。
 - 最终工件**必须由 GitHub 构建**：不允许用本地构建后上传的 EXE 冒充 GitHub 构建产物。签名环节尚待解决：固定自签名
   身份的私钥不能进入 GitHub runner，也不能放进 GitHub Secrets；能保留该身份的方案需要一个不由 GitHub 持有私钥的
   远程签名服务（例如以 OIDC 限制到本仓库/受保护环境的外部签名端点）。改用 Azure Artifact Signing 之类服务会使用

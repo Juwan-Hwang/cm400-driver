@@ -61,17 +61,23 @@ changes anything on the machine if any of it disagrees.
 The goal is that the published artifact is **built by GitHub Actions from a given commit**, and that whoever
 downloads it can verify that build provenance independently. Where this stands:
 
-- This is a **private repository on a personal account**. Per the
+- This repository is now **public**, and the probe workflow (`github-build-probe.yml`: manual dispatch only, no
+  release permissions, every action reference pinned to a full commit SHA) has been run once under each
+  visibility. While private, run `38886755727` built successfully but **failed to persist the attestation**,
+  with GitHub's own words: `Feature not available for user-owned private repositories. To enable this feature,
+  please make this repository public.` After the switch, run `38924226969` (commit `573484c`) **generated the
+  attestation**, and `gh attestation verify` inside the workflow exited 0. Per the
   [GitHub Artifact Attestations documentation](https://docs.github.com/en/actions/concepts/security/artifact-attestations),
-  attestation storage for private or internal repositories requires **GitHub Enterprise Cloud**; Free, Pro and
-  Team plan private repositories do not have it, while public repositories work on the current plan. So a
-  **publicly verifiable build proof for everyone is not available today** - and that limitation will not be
-  worked around by pointing at records only visible inside private workflows.
-- To turn that judgement into a measured result, `github-build-probe.yml` was added to the repository (manual
-  dispatch only, no release permissions, every action reference pinned to a full commit SHA): it builds from the
-  checked-out commit on a runner, attests what it built, then verifies the statement with the same command a
-  user would run. **GitHub only registers workflows present on the default branch**, so this probe cannot run
-  without touching `main`; the measured result is therefore still outstanding.
+  attestations for public repositories go to the public Sigstore instance and an immutable transparency log
+  that an outside verifier can fetch directly.
+- Independent verification was also performed: the artifact was downloaded from that run
+  (`cm400-setup.exe`, 790 016 bytes), its SHA-256 recomputed **outside the workflow** as
+  `18DE7B44FF80E4572C5D4F85D0063085B81F94681F8FBC44BA0F17E31FAC8B46`, and `gh attestation verify --owner
+  Juwan-Hwang` exited 0 with the proof's subject digest equal to that value (in-toto Statement v1).
+- Two limits that have to be read together: that proof binds an **unsigned development build**, not a release
+  artifact; and Actions artifacts **could not be fetched anonymously** (HTTP 403, login required), so the channel
+  an ordinary user can verify has to be the Release asset itself, not a temporary artifact kept during the run.
+  The eventual RC4 proof must bind the digest of the **signed** final EXE.
 - The final artifact **must be built by GitHub**: a locally built EXE must not be uploaded and described as a
   GitHub build. Signing is unresolved: the fixed self-signed identity's private key must not reach a
   GitHub-hosted runner or GitHub Secrets. Keeping that identity needs a signing service that does not hold the
