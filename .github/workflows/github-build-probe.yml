@@ -1,10 +1,10 @@
 # Development probe: can this repository produce a verifiable build provenance at all?
 #
-# This workflow exists to answer one question with a measured result rather than a guess: whether GitHub
-# Artifact Attestations are available for THIS repository as it currently stands (a private repository on a
-# personal account). GitHub's documentation says the private-repository attestation storage requires
-# GitHub Enterprise Cloud, so the plausible answer here is "no" - and an answer copied from documentation
-# would still leave the actual plan unverified.
+# This workflow exists to answer one question with a measured result rather than a guess: can this
+# repository record build provenance that a third party can retrieve and verify? GitHub's documentation ties
+# attestation storage for private repositories to GitHub Enterprise Cloud, and a run while this repository
+# was private failed with "Feature not available for user-owned private repositories" - so the question is
+# answered by running it, not by quoting the page.
 #
 # What this probe is, and is not:
 #   it IS a test of the storage and of the round trip: build here, attest what was built here, then verify
@@ -88,7 +88,8 @@ jobs:
         if: always()
         shell: pwsh
         run: |
-          Write-Host "  repo      : $env:GITHUB_REPOSITORY (private, personal account)"
+          $vis = (& gh api "repos/$env:GITHUB_REPOSITORY" --jq .visibility 2>&1).ToString().Trim()
+          Write-Host "  repo      : $env:GITHUB_REPOSITORY (visibility as reported by the API: $vis)"
           Write-Host "  commit    : $env:GITHUB_SHA"
           Write-Host "  attestation step outcome: $env:ATTEST_OUTCOME"
           Write-Host '  note: the subject is an UNSIGNED development binary. This measures attestation'
@@ -96,6 +97,18 @@ jobs:
           Write-Host '        published, signed artifact.'
         env:
           ATTEST_OUTCOME: ${{ steps.attest.outcome }}
+
+      # The built file has to leave the runner for the claim to be checkable by anyone else: a provenance
+      # statement that nobody can test against the bytes it describes proves nothing. This is a development
+      # artifact, kept briefly, and it is the same file the attestation above was issued about.
+      - name: keep the built artifact so the statement can be verified elsewhere
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: probe-build
+          path: target/release/cm400-setup.exe
+          if-no-files-found: warn
+          retention-days: 3
 
       - name: keep the attestation bundle for a day
         if: always()
