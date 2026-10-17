@@ -118,6 +118,39 @@ fn main() {
             }
         }
         Some("verify-package") => verify_package_cli(&args[1..]),
+        // Read-only, no elevation: says which commit and tree state produced this exact binary. It is a
+        // claim the file makes about itself, checked against the release record and the signature - not a
+        // proof on its own, which is why the build record also stores the file's SHA-256.
+        Some("--version") | Some("version") => {
+            println!("cm400-setup {}", env!("CARGO_PKG_VERSION"));
+            println!(
+                "  commit      : {}",
+                option_env!("CM400_GIT_COMMIT").unwrap_or("unknown")
+            );
+            println!(
+                "  describe    : {}",
+                option_env!("CM400_GIT_TAG").unwrap_or("unknown")
+            );
+            println!(
+                "  tree state  : {}",
+                option_env!("CM400_GIT_DIRTY").unwrap_or("unknown")
+            );
+            println!(
+                "  commit date : {}",
+                option_env!("CM400_BUILD_TIME").unwrap_or("unknown")
+            );
+            println!("  target      : {}", std::env::consts::ARCH);
+            println!(
+                "  profile     : {}",
+                if cfg!(debug_assertions) {
+                    "debug"
+                } else {
+                    "release"
+                }
+            );
+            println!("  publisher   : the Authenticode signature and `cm400-catsig verify` are what attest the");
+            println!("                bytes; this listing only states what was compiled.");
+        }
         // Read-only: the same reporter the control tool uses, without opening the motor interface. It
         // needs no elevation and stages nothing, so it can be run on a machine nobody has touched yet.
         Some("status") => {
@@ -151,7 +184,7 @@ fn main() {
         None => interactive_flow(),
         _ => {
             eprintln!(
-                "usage:\n   cm400-setup                        interactive install or maintenance\n  \x20 cm400-setup install   [path\\to\\cm400.inf]\n   cm400-setup uninstall [--yes]\n   cm400-setup status                   (read-only, no elevation needed)\n   cm400-setup harden-acl\n   cm400-setup verify-package  [path\\to\\cm400.inf]\n   cm400-setup --license\n   cm400-setup pinned-identity\n   cm400-setup install-driver       [path\\to\\cm400.inf]\n   cm400-setup install-device       [device-instance-id] [provider]\n   cm400-setup install-device-dif [device-instance-id]\n   cm400-setup probe\n   cm400-setup register-guid <guid>\n\n\
+                "usage:\n   cm400-setup                        interactive install or maintenance\n  \x20 cm400-setup install   [path\\to\\cm400.inf]\n   cm400-setup uninstall [--yes]\n   cm400-setup status                   (read-only, no elevation needed)\n   cm400-setup harden-acl\n   cm400-setup verify-package  [path\\to\\cm400.inf]\n   cm400-setup --version                   (which commit built this binary)\n   cm400-setup --license\n   cm400-setup pinned-identity\n   cm400-setup install-driver       [path\\to\\cm400.inf]\n   cm400-setup install-device       [device-instance-id] [provider]\n   cm400-setup install-device-dif [device-instance-id]\n   cm400-setup probe\n   cm400-setup register-guid <guid>\n\n\
                  `install` is the product entry point: preflight -> quiesce -> stage + bind ->\n\
                  verify by INTERFACE ENUMERATION (never by an API returning success).\n\
                  It never assumes a third-party rollback package exists, never touches MI_00/MI_01,\n\
